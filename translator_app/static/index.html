@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>번역기</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Korea Energy Economics Institute</p>
+          <h1>
+            <button id="titleResetButton" class="title-reset-button" type="button">번역기</button>
+          </h1>
+          <p class="lede">
+            입력 언어를 자동으로 감지하고, 번역 결과 언어만 선택합니다. 입력이 잠시 멈추면 자동으로 번역됩니다.<br />
+            선택된 용어집의 해당 언어 방향 항목만 번역에 적용됩니다.
+          </p>
+        </div>
+        <div class="meta">
+          <span id="engineBadge" class="badge">engine: loading</span>
+          <span id="statusBadge" class="badge muted">대기 중</span>
+        </div>
+      </section>
+
+      <section class="toolbar panel">
+        <div class="toolbar-row">
+          <div class="toolbar-spacer" aria-hidden="true"></div>
+          <div class="swap-group">
+            <button
+              id="swapButton"
+              class="swap-button"
+              type="button"
+              title="최근 번역 결과를 기준으로 입력과 결과를 전환합니다."
+              aria-label="입출력 전환"
+            >
+              <span class="swap-button-icon" aria-hidden="true">⇄</span>
+            </button>
+          </div>
+          <div class="language-group language-group-right">
+            <label class="select-label" for="targetLanguage">번역 언어</label>
+            <select id="targetLanguage" class="select-box"></select>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article id="sourcePanel" class="panel translation-panel">
+          <div class="panel-header">
+            <label for="sourceText" id="sourcePanelTitle" class="panel-title">원문 입력</label>
+            <span id="sourceCount" class="tiny">0자</span>
+          </div>
+          <textarea
+            id="sourceText"
+            spellcheck="false"
+            placeholder="텍스트를 입력하면 자동으로 번역됩니다."
+          ></textarea>
+        </article>
+
+        <article id="targetPanel" class="panel translation-panel">
+          <div class="panel-header">
+            <div class="output-header-group">
+              <span id="targetPanelTitle" class="panel-title">한국어 번역</span>
+              <div id="translationActivity" class="translation-activity" hidden>
+                <span class="translation-activity-dot" aria-hidden="true"></span>
+                <span id="translationActivityText">번역 중</span>
+              </div>
+            </div>
+            <span id="latencyText" class="tiny">-</span>
+          </div>
+          <div id="translationText" class="output empty">번역 결과가 여기에 표시됩니다.</div>
+        </article>
+      </section>
+
+      <section class="segments">
+        <div class="panel-header">
+          <div>
+            <span class="panel-title">구간별 보기</span>
+            <p class="tiny segment-copy">번역 처리 단위에 맞춰 원문과 번역문을 비교할 수 있습니다.</p>
+          </div>
+          <button id="toggleSegments" class="action-button secondary" type="button" aria-expanded="false">
+            열기
+          </button>
+        </div>
+        <div id="segmentsBody" class="segments-body" hidden>
+          <div id="segmentList" class="segment-list"></div>
+        </div>
+      </section>
+
+      <section class="glossary panel">
+        <div class="panel-header glossary-header">
+          <div>
+            <span class="panel-title">용어집</span>
+            <p class="tiny glossary-copy">
+              하나의 용어집에 여러 언어 방향의 항목을 함께 저장할 수 있습니다.<br />
+              현재 선택된 번역 언어에 맞는 항목만 번역에 적용됩니다.
+            </p>
+          </div>
+          <div class="glossary-actions">
+            <label class="switch">
+              <input id="useGlossary" type="checkbox" checked />
+              <span>용어집 사용</span>
+            </label>
+            <select id="glossarySelect" class="select-box glossary-select"></select>
+            <button id="newGlossaryButton" class="action-button secondary" type="button">새 용어집</button>
+            <button id="deleteGlossaryButton" class="action-button danger" type="button">용어집 삭제</button>
+            <button id="addGlossaryRow" class="action-button secondary" type="button">행 추가</button>
+            <button id="saveGlossary" class="action-button" type="button">현재 용어집 저장</button>
+          </div>
+        </div>
+
+        <div id="glossaryMeta" class="tiny glossary-meta"></div>
+
+        <div class="glossary-table-wrap">
+          <table class="glossary-table">
+            <thead>
+              <tr>
+                <th>사용</th>
+                <th>원문 언어</th>
+                <th>번역 언어</th>
+                <th>원문 용어</th>
+                <th>번역 용어</th>
+                <th>메모</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="glossaryTableBody"></tbody>
+          </table>
+        </div>
+        <div id="glossaryNotice" class="tiny glossary-notice">용어집을 불러오는 중입니다.</div>
+        <div id="glossaryHits" class="glossary-hits"></div>
+      </section>
+    </main>
+
+    <dialog id="glossaryModal" class="glossary-dialog">
+      <form id="glossaryModalForm" method="dialog" class="glossary-dialog-card">
+        <div class="panel-header modal-header">
+          <div>
+            <span class="panel-title">새 용어집 만들기</span>
+            <p class="tiny glossary-copy">이름을 정한 뒤 필요한 언어별 항목을 바로 입력할 수 있습니다.</p>
+          </div>
+          <button id="closeGlossaryModal" class="icon-button neutral" type="button">닫기</button>
+        </div>
+
+        <div class="modal-grid single">
+          <label class="field">
+            <span class="select-label">용어집 이름</span>
+            <input
+              id="newGlossaryName"
+              class="text-input"
+              type="text"
+              maxlength="120"
+              placeholder="예: 수소 에너지 정책 용어집"
+            />
+          </label>
+        </div>
+
+        <div class="glossary-table-wrap modal-table-wrap">
+          <table class="glossary-table">
+            <thead>
+              <tr>
+                <th>사용</th>
+                <th>원문 언어</th>
+                <th>번역 언어</th>
+                <th>원문 용어</th>
+                <th>번역 용어</th>
+                <th>메모</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="newGlossaryTableBody"></tbody>
+          </table>
+        </div>
+
+        <div class="modal-actions">
+          <span id="glossaryModalNotice" class="tiny"></span>
+          <div class="modal-button-row">
+            <button id="addNewGlossaryRow" class="action-button secondary" type="button">행 추가</button>
+            <button id="createGlossaryButton" class="action-button" type="submit">용어집 생성</button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="swapModal" class="glossary-dialog">
+      <form id="swapModalForm" method="dialog" class="glossary-dialog-card swap-dialog-card">
+        <div class="panel-header modal-header">
+          <div>
+            <span class="panel-title">입출력 전환</span>
+            <p id="swapModalCopy" class="tiny glossary-copy">
+              자동 전환 기준을 충족하지 않으면 감지된 원문 언어 중에서 직접 선택할 수 있습니다.
+            </p>
+          </div>
+          <button id="closeSwapModal" class="icon-button neutral" type="button">닫기</button>
+        </div>
+
+        <div class="swap-candidate-block">
+          <span class="select-label">감지된 원문 언어</span>
+          <div id="swapDetectedLanguages" class="swap-detected-languages"></div>
+        </div>
+
+        <div class="modal-actions">
+          <span id="swapModalNotice" class="tiny"></span>
+        </div>
+      </form>
+    </dialog>
+
+    <script>
+      window.TRANSLATOR_LANGUAGES = __TRANSLATOR_LANGUAGES__;
+    </script>
+    <script src="/static/app.js" type="module"></script>
+  </body>
+</html>

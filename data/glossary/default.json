@@ -1,0 +1,22 @@
+{
+  "id": "default",
+  "name": "기본 용어집",
+  "entries": [
+    {
+      "source_lang": "en",
+      "target_lang": "ko",
+      "source": "H2",
+      "target": "H₂",
+      "note": "수소 표기는 아래첨자를 유지",
+      "enabled": true
+    },
+    {
+      "source_lang": "en",
+      "target_lang": "ko",
+      "source": "electrolyzer",
+      "target": "수전해 설비",
+      "note": "수소 생산 관련 기본 용어",
+      "enabled": true
+    }
+  ]
+}
