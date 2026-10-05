@@ -23,3 +23,6 @@ data/vllm-work/
 
 # Logs
 *.log
+
+# 프롬프트 기록(실적 증빙용, 공개 저장소 제외)
+prompts/
