@@ -1,91 +1,225 @@
-# Translator App
+# 번역기 — 내부망 번역 서비스
 
-Internal multilingual translation app with automatic preview UX.
+같은 서버에서 도는 **도면 분석기**의 모델 서버(Qwen3.8-27B, vLLM)를 같이 써서, 내부망 PC 브라우저에서
+**텍스트 번역 · 문서 번역 · 글 다듬기**를 하는 패키지다. 문서와 번역 내용은 서버 밖(인터넷)으로 나가지 않는다.
 
-- Backend: FastAPI
-- Translation engine: `google/gemma-4-E4B-it` served on vLLM (OpenAI-compatible API)
-- Deployment: Docker Compose (single command)
-- GPU target: single `Tesla V100 32GB`, native FP16
+- 이 폴더를 그대로 서버의 `/home/user/translator` 로 옮겨 쓴다. 다른 경로에 두어도 동작한다.
+- GPU를 더 쓰지 않는다. 도면 분석기가 띄운 모델 서버에 연결만 한다.
+- 이 패키지가 만드는 파일은 모두 이 폴더 안에만 생긴다. `bash run.sh clean` 을 한 뒤 폴더를 지우면 설치 전 상태로 돌아간다([9절](#9-정리-설치-전-상태로)).
+- 구조·API: [docs/구조.md](docs/구조.md) · 운영(자동 재연결, 로그, 자료 보관, 업데이트): [docs/운영.md](docs/운영.md)
 
-## Features
+---
 
-- Automatic translation after typing pause
-- Parallel chunk translation against the model backend
-- Request debounce and cancellation
-- Aligned source/translation segment view
-- Server-stored named glossaries editable in the UI
-- Two-container runtime with one command
+## 1. 구성
 
-## Quick Start
+```
+ 내부망 PC 브라우저 ──▶ :7870 ─ [translator-gate] 포트 중계 ─┐
+                                                           │  ← 번역기 내부 전용 네트워크 (인터넷·서버 자신의 서비스로 나가는 길 없음)
+                              [translator-app] 번역기 화면 ─┤    텍스트·문서 번역, 글 다듬기, 용어집
+                                                           │    http://llm:8000/v1
+                       [pfdvlm-vllm] 도면 분석기의 모델 서버 ─┘    Qwen3.8-27B (GPU) — 도면 분석기와 같이 씀
+```
 
-### 1. Prerequisites
+| 컨테이너 | 이미지 | 하는 일 | 인터넷 |
+|---|---|---|---|
+| `translator-app` | `python:3.12-slim` | 화면, 번역 요청 정리, 문서 읽기·쓰기 | 차단 |
+| `translator-gate` | `python:3.12-slim` | 내부망 브라우저 접속을 번역기 화면으로 넘겨주는 중계 | 있음* |
+| `pfdvlm-vllm` | `vllm/vllm-openai:v0.30.0` | 모델 추론. **도면 분석기 소유**이며 번역기는 내부 네트워크 연결 하나만 더한다 | 차단 |
 
-- Docker Engine with Compose v2
-- NVIDIA Container Toolkit and a CUDA-capable GPU (FP16; 32 GB VRAM recommended)
-- A local copy of the `google/gemma-4-E4B-it` model directory — see [docs/MODELS.md](docs/MODELS.md) for the file list and download source
+\* 도커는 인터넷이 막힌 네트워크에서 포트를 열어 주지 못한다. 그래서 중계 컨테이너만 일반 네트워크에 붙는다. 이 컨테이너는 TCP 중계 코드 하나([translator_app/gateway.py](translator_app/gateway.py))만 실행한다. 목적지가 번역기 화면으로 고정되어 있고, 파일 시스템은 읽기 전용이며, 권한은 최소로 줄였다.
 
-### 2. Clone and Configure
+## 2. 준비물
 
-Clone the repository to any location on the host (this directory is referred to as `$PROJECT_ROOT` below), then create a `.env` from the template:
+| 항목 | 요구 | 확인 방법 |
+|---|---|---|
+| 도면 분석기 | 같은 서버에 설치되어 모델 서버가 떠 있어야 한다 (`/home/user/workspace`) | 도면 분석기 폴더에서 `bash run.sh status` |
+| Docker | 설치·실행 중 (Docker 28 이상 권장) | `docker info` |
+| GPU | 추가로 필요 없음 (도면 분석기의 모델 서버를 같이 씀) | — |
+| 도커 이미지 | `python:3.12-slim` — 도면 분석기가 이미 받아 둔 것을 같이 쓴다 | `bash run.sh check` |
+| 디스크 | 파이썬 패키지 약 0.3GB + 문서 보관 공간 | `bash run.sh check` |
+| 인터넷 | **설치(setup) 때만** 필요 | — |
+
+## 3. 설치 순서
+
+명령은 모두 프로젝트 폴더에서 실행한다. 도커를 `sudo` 로만 쓸 수 있는 계정이면 `sudo bash run.sh ...` 로 실행한다(파일 소유자는 본인 계정으로 남는다).
+
+**① 폴더 옮기기** — 이 폴더 전체를 서버의 `/home/user/translator` 에 둔다.
+- FTP로 옮길 때는 **바이너리 모드**로 보낸다(FileZilla: 전송 → 전송 유형 → 바이너리). 자동·텍스트(ASCII) 모드로 보내면 스크립트의 줄바꿈이 윈도 방식(CRLF)으로 바뀐다. `run.sh` 가 스스로 고치지만, 다른 파일이 깨질 수 있다.
 
 ```bash
-cp .env.example .env
+cd /home/user/translator
 ```
 
-Edit `.env` and set the one required variable, `MODEL_PATH`, to the absolute host path of your model directory:
-
-```
-MODEL_PATH=/absolute/path/to/gemma-4-E4B-it
-```
-
-All other settings have sensible defaults.
-
-### 3. Run
+**② 도면 분석기 모델 서버 확인** — 꺼져 있으면 도면 분석기를 먼저 시작한다.
 
 ```bash
-docker compose up -d --build
+cd /home/user/workspace && bash run.sh start
 ```
 
-Open `http://<server-ip>:7860`.
-
-To target a non-default GPU index:
+**③ 설치** — 인터넷이 될 때 한 번. 화면용 파이썬 패키지를 폴더 안 `cache/pylib` 에 설치한다.
 
 ```bash
-VLLM_GPU_DEVICE=1 docker compose up -d --build
+bash run.sh setup
 ```
 
-### 4. Stop
+**④ 점검** (도커·이미지·패키지·도면 분석기 모델 서버·포트·디스크)
 
 ```bash
-docker compose stop
+bash run.sh check
 ```
 
-## Layout
+**⑤ 시작**
 
-```
-$PROJECT_ROOT
-  compose.yaml
-  Dockerfile.app
-  translator_app/        # FastAPI app
-  data/
-    glossary/            # server-stored glossaries, editable from the UI
-    vllm-work/           # runtime cache + symlinks (created on first start)
+```bash
+bash run.sh start
 ```
 
-- `data/glossary/` is bind-mounted into the app container at `/app/data/glossary`.
-- `data/vllm-work/` holds the vLLM runtime shim, Triton cache, and HF cache. Safe to delete when the stack is stopped — it will be recreated on next start.
-- The model directory at `MODEL_PATH` is bind-mounted **read-only**; original files are never written to.
+모델 서버에 연결하고 화면을 띄운 뒤 접속 주소를 보여 준다(수십 초).
 
-## Docs
+```
+== 접속 ==
+  http://10.x.x.x:7870
+```
 
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [Model Guide](docs/MODELS.md)
-- [Offline Notes](docs/OFFLINE_SETUP.md)
-- [Runbook](docs/RUNBOOK.md)
+**⑥ 접속** — 같은 내부망 PC의 브라우저로 위 주소에 들어간다.
 
-## Notes
+| 다른 명령 | |
+|---|---|
+| `bash run.sh status` | 실행 상태, 모델 연결, 모델 서버 부하, 접속 주소 |
+| `bash run.sh selftest` | 동작 시험 (짧은 문장 번역 + 작은 DOCX·XLSX·PDF·TXT 번역) |
+| `bash run.sh logs` / `logs gate` / `logs linker` | 화면 / 중계기 / 자동 재연결 기록 (Ctrl+C 로 나감) |
+| `bash run.sh stop` | 번역기 중지 (도면 분석기는 그대로) |
 
-- Host-level `pip` / `uv` are not required — the app image is built inside Docker.
-- Leave `CORS_ALLOW_ORIGINS` empty for same-origin use. Set it only when cross-origin access is required.
-- Default container paths (`/app`, `/vllm-work`, `/models/source`) are fixed; you only need to set host-side paths via `.env`.
-- Docker-generated image layers and build cache live under Docker's own data root, not under `$PROJECT_ROOT`.
+서버를 다시 켜면 자동으로 뜨지 않는다. 도면 분석기와 번역기를 각각 `bash run.sh start` 로 다시 띄운다(순서는 상관없다).
+
+## 4. 화면 사용법
+
+| 탭·메뉴 | 쓰는 법 |
+|---|---|
+| **텍스트 번역** | 왼쪽에 입력하면 잠시 뒤 자동으로 번역된다(Ctrl+Enter: 바로). 원문 언어는 자동 감지. 어조(합니다체·해요체·한다체·개조식), 용어집, 맥락(번역하지 않고 참고만 하는 설명)을 고를 수 있다. 번역문의 문장을 누르면 다른 표현, 원문 단어를 두 번 누르면 뜻풀이가 나온다 |
+| **문서 번역** | 파일을 끌어다 놓는다. 진행률·남은 시간이 보이고, 끝나면 내려받는다. 원문+번역 대역본, PDF는 레이아웃 유지 또는 Word 로 받기. 숫자·단위 빠짐, 용어집 미적용, 번역 안 된 문장은 검수 결과로 표시된다 |
+| **글 다듬기** | 맞춤법·문법·표현을 고친다(다른 언어로 바꾸지 않음). 문체(다듬기·격식·간결·쉽게·친근·개조식·학술·업무)를 고르면 바뀐 곳이 표시되고, "적용"으로 입력란에 반영한다 |
+| **용어집** | 원문 용어 → 번역 용어를 고정한다. CSV·TSV 가져오기(추가/바꾸기)와 내보내기(엑셀에서 바로 열림) |
+| **기록** | 켜면 최근 50건을 **이 PC의 브라우저에만** 저장한다(기본 꺼짐, 서버에는 남지 않음) |
+
+## 5. 지원 문서 형식
+
+| 형식 | 올리는 파일 | 받는 파일 | 서식 | 비고 |
+|---|---|---|---|---|
+| Word | `.docx` | `.docx` | 유지 | 머리글·바닥글·각주·메모·표·텍스트 상자 포함. 대역본 가능 |
+| PowerPoint | `.pptx` | `.pptx` | 유지 | 슬라이드·발표자 메모 |
+| Excel | `.xlsx` | `.xlsx` | 유지 | 글자 셀만 번역 (수식·숫자·시트 이름은 그대로) |
+| 한글 | `.hwpx` | `.hwpx` | 유지 | 대역본 가능 |
+| 한글 (예전 형식) | `.hwp` | `.docx` | 글자만 | 한글에서 HWPX로 저장해 올리면 서식이 유지된다 |
+| PDF | `.pdf` | `.pdf` 또는 `.docx` | 레이아웃 유지 | 스캔한 쪽은 글자를 읽어 번역한 쪽을 바로 뒤에 넣는다 |
+| 텍스트 | `.txt` `.md` | 같은 형식 | — | 대역본 가능 |
+| 자막 | `.srt` `.vtt` | 같은 형식 | 시간 정보 유지 | |
+| 웹 문서 | `.html` `.htm` | 같은 형식 | 태그 유지 | |
+| 이미지 | `.png` `.jpg` `.jpeg` `.webp` | `.docx` | — | 그림 속 글자를 읽어 번역 |
+
+- `.doc` `.ppt` `.xls` 는 받지 않는다. 오피스·한글에서 새 형식(`.docx` 등)으로 저장해 올린다.
+- 파일 하나 최대 50MB (`config.env` 의 `DOC_MAX_MB`).
+
+## 6. 도면 분석기와 함께 쓰기
+
+- 모델 서버 하나를 두 프로그램이 나눠 쓴다. 모델 서버가 한꺼번에 처리하는 요청은 **8개**까지다. 번역기는 그중 **최대 3개**(`LLM_MAX_PARALLEL`), 문서 번역은 **2개**(`LLM_DOC_PARALLEL`)까지만 쓰고 나머지는 도면 분석기 몫으로 남긴다.
+- 번역기 안에서는 텍스트 번역이 문서 번역보다 먼저 처리된다.
+- 생성 속도는 혼자 쓸 때 약 30 토큰/초(BF16 원본), FP8 판 약 47 토큰/초다. 여러 사람이 동시에 쓰면 각자 조금씩 느려진다. 화면 위 상태 표시가 **혼잡**이면 모델 서버에 대기 중인 요청이 있다는 뜻이다.
+- **도면 분석기를 다시 시작하면**(stop → start, 프로파일 변경) 모델 서버 컨테이너가 새로 만들어진다. 번역기가 이를 알아채고 **몇 초 안에 자동으로 다시 연결**한다. 모델 이름이 바뀌어도(FP8 판 등) 저절로 따라간다.
+- **도면 분석기를 멈추면 번역도 멈춘다.** 화면은 떠 있고 상태가 "연결 안 됨"으로 바뀐다. 그동안 진행 중이던 문서 번역은 실패할 수 있으니 다시 올린다.
+- 두 패키지를 모두 정리할 때는 **번역기를 먼저** `clean` 한다. 번역기가 쓰는 `python:3.12-slim` 이미지는 도면 분석기의 정리 단계에서 지울지 묻는다.
+
+## 7. 보안과 자료 취급
+
+- 번역기 화면 컨테이너는 **인터넷이 차단된 내부 전용 네트워크**에서만 동작한다. 같은 서버의 다른 서비스(프록시 등)에도 닿지 못하게 막았다. 닿는 곳은 모델 서버 하나뿐이다.
+- 도면 분석기 쪽 네트워크에는 붙지 않는다. 도면 분석기 모델 서버에 번역기 네트워크 연결 하나만 더하며, 모델 서버는 여전히 인터넷이 차단된 상태다. `stop`·`clean` 때 그 연결만 뗀다.
+- **올린 문서와 번역본**은 `data/jobs/` 에 두고 **24시간 뒤 자동으로 지운다**(`DOC_RETENTION_HOURS`). 화면에서 바로 지울 수도 있다. 문서 목록은 올린 사람의 브라우저에만 있어 다른 사람의 문서는 보이지 않는다.
+- **접속 기록에 문서 이름을 남기지 않는다**(웹 접속 기록을 끔). 번역 내용도 서버 로그에 쓰지 않는다.
+- 번역 기록(기록 메뉴)은 기본으로 꺼져 있고, 켜도 접속한 PC의 브라우저에만 저장된다.
+- **로그인**: `config.env` 의 `UI_AUTH="1"` 로 켠다. 기본은 꺼져 있어 같은 내부망 누구나 접속할 수 있다.
+- **접속 PC 제한**: `config.env` 의 `UI_ALLOW` 에 허용할 PC 주소 범위를 적으면 그 밖의 PC는 중계기에서 끊는다(예: `UI_ALLOW="10.1.20.0/24"`).
+  - 도커가 연 포트는 우분투 방화벽(ufw) 규칙을 거치지 않는다. 기관 방화벽 정책도 함께 확인한다.
+- 컨테이너는 읽기 전용 파일 시스템·최소 권한으로 돌고, 코어 덤프를 꺼서 문서가 담긴 메모리가 서버 다른 곳에 저장되지 않는다.
+- 다음은 서버 밖으로 가져가지 않는다: `data/`(용어집·문서), `logs/`.
+- 밖으로 공유해도 되는 것: `bash run.sh selftest` 와 `bash run.sh check` 출력(공개 문장만 씀).
+
+## 8. 설정 (`config.env`)
+
+고친 뒤 `bash run.sh start` 를 다시 하면 반영된다.
+
+| 항목 | 기본값 | 뜻 |
+|---|---|---|
+| `UI_PORT` | `7870` | 접속 포트 (7860 은 도면 분석기) |
+| `UI_BIND` | `0.0.0.0` | `127.0.0.1` 로 하면 서버 자신에서만 접속 |
+| `UI_ALLOW` | (비움) | 접속 허용 PC 주소 범위 |
+| `UI_AUTH` / `UI_USER` / `UI_PASSWORD` | `0` / `translator` / (비움) | 로그인. 비밀번호를 비우면 처음 시작할 때 만들어 `state/ui_password` 에 둔다 |
+| `LLM_CONTAINER` / `LLM_PORT` | `pfdvlm-vllm` / `8000` | 같이 쓸 모델 서버 컨테이너 |
+| `LLM_MODEL` | (비움) | 비우면 모델 서버가 알려 주는 이름을 쓴다 |
+| `LLM_URL` | (비움) | 다른 곳의 OpenAI 호환 서버를 쓸 때만. 적으면 번역기 화면이 일반 네트워크에도 붙는다(격리 약해짐) |
+| `LLM_MAX_PARALLEL` / `LLM_DOC_PARALLEL` | `3` / `2` | 모델 서버에 한꺼번에 보내는 요청 수 (전체 / 문서 번역) |
+| `DOC_MAX_MB` | `50` | 올릴 수 있는 파일 크기 |
+| `DOC_RETENTION_HOURS` | `24` | 문서·번역본 보관 시간 |
+| `DOC_JOB_CONCURRENCY` | `2` | 한꺼번에 처리하는 문서 수 |
+| `NET_INT_SUBNET` / `NET_PUB_SUBNET` | (비움) | 도커 내부 네트워크 대역 (접속 문제 때만) |
+| `SETUP_PROXY` / `SETUP_PIP_INDEX_URL` | (비움) | setup 때 프록시·패키지 저장소 |
+
+## 9. 정리 (설치 전 상태로)
+
+필요하면 먼저 용어집을 화면에서 내보내(CSV) 둔다.
+
+```bash
+bash run.sh clean
+```
+
+번역기 컨테이너·네트워크를 지우고, 도면 분석기 모델 서버에서 번역기 네트워크 연결을 떼고, 폴더 안 파일의 소유자를 본인 계정으로 맞춘다(sudo 없이 지울 수 있게). `python:3.12-slim` 이미지는 도면 분석기 등 다른 컨테이너가 쓰고 있으면 남기고, setup 전부터 있던 것이면 기본으로 남긴다.
+
+끝으로 폴더를 지운다.
+
+```bash
+rm -rf /home/user/translator
+```
+
+이 두 단계로 번역기가 서버에 남긴 것은 모두 사라진다.
+- 파이썬 패키지, 용어집, 올린 문서·번역본, 로그, 상태 파일, 도커 클라이언트 설정(`DOCKER_CONFIG`)은 모두 폴더 안에 있다.
+- 도커 이미지를 빌드하지 않으므로 빌드 캐시가 생기지 않는다. 컨테이너 로그는 컨테이너와 함께 지워진다.
+- 시스템 서비스(systemd)·예약 작업(cron)·`/etc` 설정을 만들지 않는다. 자동 재연결 감시는 `stop` 때 끝나는 일반 프로세스다.
+- **도면 분석기는 건드리지 않는다**: 컨테이너·네트워크·이미지(`vllm/vllm-openai`)·모델 파일·`/home/user/workspace` 폴더 모두 그대로다.
+
+## 10. 문제 해결
+
+| 증상 | 조치 |
+|---|---|
+| `$'\r': command not found` 등 이상한 오류 | 윈도에서 줄바꿈이 바뀐 경우. `sed -i 's/\r$//' run.sh scripts/*.sh config.env` (그 뒤로는 run.sh 가 CRLF·BOM 을 스스로 고친다) |
+| `도커 사용 권한이 없습니다` | `sudo bash run.sh ...` 로 실행 |
+| 화면 위 상태가 **연결 안 됨** | 도면 분석기 모델 서버가 꺼져 있다. `cd /home/user/workspace && bash run.sh start`. 켜져 있는데도 그러면 `bash run.sh status` 로 연결을 확인하고 `bash run.sh start` |
+| start 에 "모델 서버가 아직 준비 중" | 도면 분석기의 첫 시작은 5~15분 걸린다. 준비되면 바로 쓸 수 있다 |
+| 도면 분석기를 다시 시작한 뒤 번역이 안 됨 | 보통 몇 초 안에 자동으로 다시 연결된다. `bash run.sh logs linker` 로 확인하고, 그래도 안 되면 `bash run.sh start` |
+| 번역이 느림, 상태가 **혼잡** | 도면 분석기와 번역기 사용자가 동시에 많이 쓰는 경우. 잠시 뒤 다시 하거나, 큰 문서는 한가한 시간에 올린다 |
+| 일부 PC에서만 접속이 안 됨 | 그 PC의 주소가 도커 내부 대역(`start` 가 보여 줌)과 겹친 경우. `config.env` 의 `NET_INT_SUBNET`, `NET_PUB_SUBNET` 에 기관 내부망·도면 분석기와 겹치지 않는 대역을 적고 `bash run.sh start`. 또는 `UI_ALLOW` 범위 밖인지 확인(`bash run.sh logs gate`) |
+| `UI_ALLOW` 를 적었더니 모든 PC가 차단됨 | `bash run.sh logs gate` 의 "차단" 줄에 모든 접속이 `172.x.0.1` 같은 같은 주소로 찍히면, 이 서버의 도커가 접속한 PC 주소를 감추는 방식이라 `UI_ALLOW` 를 쓸 수 없다. `UI_ALLOW=""` 로 되돌리고 기관 방화벽으로 제한한다 |
+| 포트 7870 이 이미 쓰임 | `config.env` 의 `UI_PORT` 를 바꾸고 `bash run.sh start` |
+| `requirements.txt 가 바뀌었습니다` | 업데이트로 패키지 목록이 바뀐 경우. 인터넷이 될 때 `bash run.sh setup` |
+| setup 에서 파이썬 패키지 설치가 멈추거나 실패 | 인터넷이 프록시를 거쳐야 하는 경우. `config.env` 의 `SETUP_PROXY` 에 프록시 주소를 적는다 |
+| 문서 번역에서 "지원하지 않는 형식" | `.doc` `.ppt` `.xls` 는 새 형식으로 저장해 올린다. `.hwp` 는 되지만 서식이 빠지므로 HWPX 로 저장해 올리면 좋다 |
+| 파일이 너무 큼 | `config.env` 의 `DOC_MAX_MB` 를 늘리고 `bash run.sh start` |
+| 비밀번호를 잊음 | `cat state/ui_password` (config.env 에 `UI_PASSWORD` 를 적었다면 그 값) |
+| 잘 되는지 확인하고 싶음 | `bash run.sh selftest` — 항목별 PASS/FAIL 과 걸린 시간을 보여 준다 |
+
+로그(`logs/`)에는 번역 중 오류가 난 문장 일부가 섞일 수 있다. 문제를 외부(상용 AI 도구 포함)에 문의할 때는 로그를 그대로 붙이지 말고, 공개 문장으로 같은 문제를 재현해서 전달한다.
+
+## 11. 폴더 구조
+
+```
+run.sh                 실행 스크립트 (명령 목록: bash run.sh help)
+config.env             설정 (접속 포트·허용 범위, 로그인, 모델 서버, 동시 요청 한도, 문서 보관 시간)
+scripts/               run.sh 공통 함수(lib.sh), 모델 서버 자동 재연결(linker.sh)
+translator_app/        파이썬 코드 (화면 static/, 번역 services/·llm/, 문서 documents/, 중계 gateway.py, 동작 시험 selftest.py)
+requirements.txt       화면용 파이썬 패키지 (버전·해시 고정)
+data/glossary/         용어집 (화면에서 고친 내용이 여기 저장됨)
+docs/                  구조·운영 설명
+dev/  tests/           개발 PC 시험용 (서버에서는 쓰지 않음)
+── 아래는 실행하면 생긴다 ──
+cache/                 파이썬 패키지, 도커 클라이언트 설정
+data/jobs/             올린 문서와 번역본 (24시간 뒤 자동 삭제)
+logs/  state/          로그, 실행 상태
+```
