@@ -302,6 +302,11 @@ class Handler(BaseHTTPRequestHandler):
                 "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n"
                 "# TYPE vllm:num_requests_waiting gauge\n"
                 f"vllm:num_requests_waiting{{{lbl}}} {float(waiting)}\n"
+                # v0.30 은 대기 수를 이유별로도 낸다 (합 = num_requests_waiting). 이름 앞부분이 같아 잘못 세기 쉽다
+                "# HELP vllm:num_requests_waiting_by_reason Number of waiting requests by reason.\n"
+                "# TYPE vllm:num_requests_waiting_by_reason gauge\n"
+                f'vllm:num_requests_waiting_by_reason{{{lbl},reason="capacity"}} {float(waiting)}\n'
+                f'vllm:num_requests_waiting_by_reason{{{lbl},reason="deferred"}} 0.0\n'
             )
             self.send_bytes(200, text.encode(), "text/plain; version=0.0.4; charset=utf-8")
         elif path == "/version":

@@ -61,6 +61,26 @@ def test_health_models_metrics(base):
     assert httpx.get(f"{base}/nope").status_code == 404
 
 
+def test_metrics_include_waiting_by_reason_like_v030():
+    """v0.30 처럼 대기 수를 이유별로도 낸다. 이름 앞부분이 같은 지표를 두 번 세지 않는지 시험할 수 있게."""
+    from translator_app import selftest
+    from translator_app.llm.client import parse_metrics
+
+    srv = fake.make_server(fake.parse_args(["--port", "0"]))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        srv.state.waiting = 3
+        host, port = srv.server_address[:2]
+        metrics = httpx.get(f"http://{host}:{port}/metrics").text
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert re.search(r'^vllm:num_requests_waiting_by_reason\{[^}]*reason="capacity"\} 3\.0$', metrics, re.M)
+    assert re.search(r'^vllm:num_requests_waiting_by_reason\{[^}]*reason="deferred"\} 0\.0$', metrics, re.M)
+    assert selftest.load_from_metrics(metrics)["waiting"] == 3.0
+    assert parse_metrics(metrics).get("waiting") == 3.0
+
+
 def test_plain_translation_uses_target_line_and_keeps_tags(base):
     r = chat(base, messages=[
         {"role": "system", "content": "Translate.\nTarget language: Korean (ko)"},

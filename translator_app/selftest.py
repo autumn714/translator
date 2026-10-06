@@ -17,6 +17,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import time
 import unicodedata
@@ -264,9 +265,14 @@ def short(s: str, n: int = 48) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def flag_on(value: str | None) -> bool:
+    """UI_AUTH 같은 켜기/끄기 값: 1·true·yes·on (대소문자·앞뒤 공백 무관) 이면 켬 (run.sh·config.py 와 같은 규칙)."""
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def login_if_needed(c: Client, rep: Report) -> bool:
     status, _ = c.json("GET", "/api/status")
-    if status != 401 and os.environ.get("UI_AUTH", "0") != "1":
+    if status != 401 and not flag_on(os.environ.get("UI_AUTH")):
         return True
     user, pw = os.environ.get("UI_USER", ""), os.environ.get("UI_PASSWORD", "")
     t0 = time.monotonic()
@@ -437,6 +443,28 @@ def run(base: str, skip_docs: bool, wait: float) -> int:
 
 
 # ------------------------------------------------------------------ 모델 서버 상태 (run.sh status)
+def load_from_metrics(text: str) -> dict[str, float]:
+    """/metrics 에서 처리 중·대기 요청 수를 더한다 (엔진·모델 라벨별 값의 합).
+
+    이름이 정확히 같은 지표만 센다. vLLM v0.30 의 vllm:num_requests_waiting_by_reason 은
+    대기 수를 이유별로 나눈 것이라 더하면 두 번 세게 된다.
+    """
+    names = {"vllm:num_requests_running": "running", "vllm:num_requests_waiting": "waiting"}
+    sums = {"running": 0.0, "waiting": 0.0}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key = names.get(re.split(r"[{\s]", line, maxsplit=1)[0])
+        if key is None:
+            continue
+        try:
+            sums[key] += float(line.rsplit(None, 1)[1])
+        except (IndexError, ValueError):
+            pass
+    return sums
+
+
 def probe() -> int:
     base = (os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "http://llm:8000/v1").rstrip("/")
     key = os.environ.get("LLM_API_KEY", "")
@@ -459,14 +487,7 @@ def probe() -> int:
     try:
         with urllib.request.urlopen(urllib.request.Request(root + "/metrics", headers=headers), timeout=5) as r:  # noqa: S310
             text = r.read().decode("utf-8", "replace")
-        sums = {"running": 0.0, "waiting": 0.0}
-        for raw in text.splitlines():
-            for key_name in sums:
-                if raw.startswith(f"vllm:num_requests_{key_name}"):
-                    try:
-                        sums[key_name] += float(raw.rsplit(" ", 1)[1])
-                    except (IndexError, ValueError):
-                        pass
+        sums = load_from_metrics(text)
         line += f" · 처리 중 {int(sums['running'])} · 대기 {int(sums['waiting'])} (도면 분석기 요청 포함)"
     except Exception:  # noqa: BLE001
         pass

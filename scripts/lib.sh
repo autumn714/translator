@@ -6,6 +6,7 @@
 #  - 이 프로젝트가 만드는 파일은 모두 $WS(프로젝트 폴더) 안에만 생긴다.
 #    (파이썬 패키지, 로그, 상태, 용어집, 올린 문서·번역본, 도커 클라이언트 설정까지)
 #  - 도커 쪽 흔적(컨테이너·네트워크)에는 라벨을 붙여 두고 stop/clean 에서 지운다.
+#    라벨 값은 NAME_PREFIX 라서, 이름 앞머리를 바꾼 두 번째 복사본과 서로 건드리지 않는다.
 #  - 번역기 화면은 인터넷으로 나가는 길이 없는 내부 전용 네트워크에서만 돈다.
 #    내부망 PC의 브라우저 접속은 포트 중계 컨테이너(gate)만 받는다.
 #  - 모델 서버는 도면 분석기가 띄운 컨테이너를 같이 쓴다. 그 컨테이너에는 번역기 내부
@@ -13,8 +14,10 @@
 #    파일은 멈추거나 지우거나 바꾸지 않는다.
 
 LABEL_KEY="translator.project"
-LABEL="${LABEL_KEY}=1"
 LLM_ALIAS="llm"
+# 도면 분석기(같은 서버의 다른 패키지)가 자기 컨테이너·네트워크에 붙이는 라벨과 모델 서버 이미지
+COTENANT_LABEL_KEY="pfdvlm.project"
+COTENANT_IMAGE_REPO="vllm/vllm-openai"
 
 # ------------------------------------------------------------------ 출력
 if [[ -t 1 ]]; then C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_B=$'\e[1m'; C_0=$'\e[0m'; else C_G=; C_Y=; C_R=; C_B=; C_0=; fi
@@ -52,6 +55,7 @@ load_config() {
   UI_BIND="0.0.0.0"; UI_PORT="7870"; UI_ALLOW=""; UI_AUTH="0"; UI_USER="translator"; UI_PASSWORD=""
   LLM_CONTAINER="pfdvlm-vllm"; LLM_PORT="8000"; LLM_MODEL=""; LLM_URL=""; LLM_API_KEY="EMPTY"
   LLM_MAX_PARALLEL="3"; LLM_DOC_PARALLEL="2"; DOC_MAX_MB="50"; DOC_RETENTION_HOURS="24"; DOC_JOB_CONCURRENCY="2"
+  DOC_DISK_QUOTA_MB="2048"; APP_MEMORY="8g"
   NET_INT_SUBNET=""; NET_PUB_SUBNET=""; SETUP_PROXY=""; SETUP_PIP_INDEX_URL=""; CONTAINER_TZ="KST-9"
   PY_IMAGE="python:3.12-slim"; NAME_PREFIX="translator"
   # shellcheck source=/dev/null
@@ -62,9 +66,15 @@ load_config() {
     # shellcheck source=/dev/null
     source "$extra"
   fi
+  UI_AUTH=$(normalize_flag "$UI_AUTH")
   N_APP="${NAME_PREFIX}-app"; N_GATE="${NAME_PREFIX}-gate"
   NET_INT="${NAME_PREFIX}-int"; NET_PUB="${NAME_PREFIX}-pub"
   if [[ -n "$LLM_URL" ]]; then LLM_BASE="${LLM_URL%/}"; else LLM_BASE="http://${LLM_ALIAS}:${LLM_PORT}/v1"; fi
+
+  # 정리용 라벨 (복사본마다 다름). 모든 컨테이너 공통: 라벨, 로그 크기 제한,
+  # 코어 덤프 금지(문서가 담긴 메모리가 호스트에 떨어지지 않게)
+  LABEL="${LABEL_KEY}=${NAME_PREFIX}"
+  COMMON_ARGS=(--label "$LABEL" --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 --ulimit core=0)
 
   # 컨테이너 안에서 파일을 만들 사용자 = 이 스크립트를 실행한 사람 (sudo 로 실행해도 원래 사용자)
   RUN_UID="${SUDO_UID:-$(id -u)}"
@@ -73,6 +83,17 @@ load_config() {
   # 도커 클라이언트 설정도 프로젝트 폴더 안에 둔다 (~/.docker 에 흔적을 남기지 않기 위해)
   export DOCKER_CONFIG="$WS/cache/docker-config"
   mkd "$WS/cache" "$DOCKER_CONFIG"
+}
+
+# 켜기/끄기 설정값: 1·true·yes·on (대소문자·앞뒤 공백 무관) 이면 "1", 그 밖은 "0".
+# 화면 프로그램(translator_app/config.py)도 같은 규칙으로 읽는다.
+normalize_flag() {
+  local v="${1:-}"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "${v,,}" in
+    1|true|yes|on) echo "1";;
+    *) echo "0";;
+  esac
 }
 
 # sudo 로 실행했을 때 root 소유 파일이 남지 않게 한다
@@ -134,9 +155,27 @@ need_docker() {
 have_image() { docker image inspect "$1" >/dev/null 2>&1; }
 running()    { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == "true" ]]; }
 exists()     { docker inspect --type container "$1" >/dev/null 2>&1; }
+# 실행 중이고 한 번도 비정상 종료로 다시 시작되지 않았는지 (--restart 로 되살아나는 중이면 아니다)
+running_clean() {
+  [[ "$(docker inspect -f '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' "$1" 2>/dev/null)" == "true false 0" ]]
+}
+# 번역기가 만든 컨테이너·네트워크인지 (라벨 키만 본다: 예전 판의 translator.project=1 도 포함)
+ours_container() { [[ -n "$(docker inspect --type container -f "{{index .Config.Labels \"$LABEL_KEY\"}}" "$1" 2>/dev/null)" ]]; }
+ours_network()   { [[ -n "$(docker network inspect -f "{{index .Labels \"$LABEL_KEY\"}}" "$1" 2>/dev/null)" ]]; }
 
-# 모든 컨테이너 공통: 라벨(정리용), 로그 크기 제한, 코어 덤프 금지(문서가 담긴 메모리가 호스트에 떨어지지 않게)
-COMMON_ARGS=(--label "$LABEL" --log-driver json-file --log-opt max-size=20m --log-opt max-file=2 --ulimit core=0)
+# 컨테이너 로그를 logs/ 의 파일로 옮겨 적는다. 컨테이너가 비정상 종료 뒤 다시 시작되어도(--restart)
+# 이어서 적고, 컨테이너가 지워지거나 완전히 멈추면 끝난다.
+follow_logs() {  # follow_logs 컨테이너 파일
+  # shellcheck disable=SC2016  # 안쪽 bash 가 풀 변수다
+  setsid nohup bash -c '
+    since=""
+    while :; do
+      docker logs -f ${since:+--since "$since"} "$1" >> "$2" 2>&1
+      since=$(date +%s.%N)
+      sleep 1
+      case "$(docker inspect -f "{{.State.Status}}" "$1" 2>/dev/null)" in running|restarting) ;; *) exit 0;; esac
+    done' follow_logs "$1" "$2" >/dev/null 2>&1 < /dev/null &
+}
 
 # 파이썬 패키지가 설치되어 있는지, requirements.txt 와 같은 판인지
 req_hash()     { sha256sum "$WS/requirements.txt" | cut -d' ' -f1; }
@@ -160,6 +199,38 @@ create_networks() {
 
 port_busy() { command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :$UI_PORT" 2>/dev/null | grep -q .; }
 
+# UI_ALLOW 를 중계기와 같은 코드(gateway.py --check)로 확인한다. 틀린 값이면 중계기가 시작하자마자 멈추므로
+# 컨테이너를 만들기 전에 막는다. 문제가 있으면 ALLOW_ERR 에 설명을 두고 1
+check_allow() {
+  ALLOW_ERR=""
+  [[ -n "${UI_ALLOW//[[:space:],]/}" ]] || return 0
+  if ALLOW_ERR=$(docker run --rm "${COMMON_ARGS[@]}" --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true --user "$RUN_UID:$RUN_GID" -e PYTHONDONTWRITEBYTECODE=1 \
+      --mount "type=bind,src=$WS/translator_app/gateway.py,dst=/w/gateway.py,readonly" \
+      "$PY_IMAGE" python /w/gateway.py --check --allow "$UI_ALLOW" 2>&1); then
+    ALLOW_ERR=""; return 0
+  fi
+  ALLOW_ERR=$(tail -n 1 <<<"$ALLOW_ERR")
+  return 1
+}
+
+# 이 이미지로 만든 컨테이너 이름들 (멈춘 것 포함)
+image_users() { docker ps -a --filter "ancestor=$1" --format '{{.Names}}' 2>/dev/null | xargs; }
+
+# 같은 서버의 도면 분석기가 설치되어 있어 python 이미지를 같이 쓸 수 있는지. 그렇다면 이유를 출력하고 0
+#   도면 분석기는 stop 때 자기 컨테이너를 모두 지우므로, 컨테이너가 없어도 설치 흔적(모델 서버 컨테이너,
+#   pfdvlm.project 라벨, vllm/vllm-openai 이미지)이 있으면 같은 이미지를 다시 쓸 것으로 본다.
+cotenant_reason() {
+  if ! llm_external && exists "$LLM_CONTAINER"; then echo "도면 분석기 모델 서버($LLM_CONTAINER)가 있습니다"; return 0; fi
+  if [[ -n "$(docker ps -aq --filter "label=$COTENANT_LABEL_KEY" 2>/dev/null)$(docker network ls -q --filter "label=$COTENANT_LABEL_KEY" 2>/dev/null)" ]]; then
+    echo "도면 분석기의 컨테이너·네트워크가 있습니다"; return 0
+  fi
+  if [[ -n "$(docker image ls -q "$COTENANT_IMAGE_REPO" 2>/dev/null)" ]]; then
+    echo "도면 분석기 모델 서버 이미지($COTENANT_IMAGE_REPO)가 있습니다"; return 0
+  fi
+  return 1
+}
+
 # ------------------------------------------------------------------ 모델 서버 (도면 분석기) 연결
 llm_external() { [[ -n "${LLM_URL:-}" ]]; }
 
@@ -172,9 +243,22 @@ llm_model_name() {
   llm_exec_py "import json, urllib.request; d = json.load(urllib.request.urlopen('http://127.0.0.1:${LLM_PORT}/v1/models', timeout=5)); print(', '.join(m['id'] for m in d.get('data', [])))"
 }
 
-# 모델 서버 컨테이너가 번역기 내부 네트워크에 붙어 있는지
+# 모델 서버 컨테이너에 번역기 네트워크(이름) 연결 정보가 있는지. 멈춘 컨테이너도 본다.
+#   출력: 연결된 네트워크 ID (멈춘 상태에서 붙여 아직 ID 가 없으면 빈 줄). 연결 정보가 없으면 1
+llm_entry() {  # llm_entry 네트워크이름
+  local out
+  out=$(docker inspect --type container -f "{{with index .NetworkSettings.Networks \"$1\"}}{{.NetworkID}}|{{end}}" "$LLM_CONTAINER" 2>/dev/null) || return 1
+  [[ -n "$out" ]] || return 1
+  echo "${out%|}"
+}
+
+# 모델 서버 컨테이너가 지금 있는 번역기 내부 네트워크에 붙어 있는지.
+#   연결 정보가 예전(지워진) 네트워크를 가리키면 붙어 있지 않은 것으로 본다.
 llm_connected() {
-  [[ -n "$(docker inspect -f "{{with index .NetworkSettings.Networks \"$NET_INT\"}}y{{end}}" "$LLM_CONTAINER" 2>/dev/null)" ]]
+  local want got
+  want=$(docker network inspect -f '{{.Id}}' "$NET_INT" 2>/dev/null) || return 1
+  got=$(llm_entry "$NET_INT") || return 1
+  [[ -z "$got" || "$got" == "$want" ]]
 }
 
 # 모델 서버 컨테이너를 번역기 내부 네트워크에 별칭 llm 으로 붙인다 (이미 붙어 있으면 그대로)
@@ -183,6 +267,8 @@ llm_link() {
   LINK_ERR=""
   exists "$LLM_CONTAINER" || return 3
   llm_connected && return 2
+  # 지워진 네트워크를 가리키는 연결 정보(멈춘 컨테이너에 남은 것)는 먼저 지운다
+  if llm_entry "$NET_INT" >/dev/null; then docker network disconnect "$NET_INT" "$LLM_CONTAINER" >/dev/null 2>&1 || true; fi
   local out
   if out=$(docker network connect --alias "$LLM_ALIAS" "$NET_INT" "$LLM_CONTAINER" 2>&1); then return 0; fi
   if grep -qi 'already exists' <<<"$out"; then return 2; fi
@@ -192,17 +278,33 @@ llm_link() {
 
 # 번역기 네트워크에 붙은 다른 프로젝트 컨테이너(모델 서버)를 뗀다.
 #   떼는 것은 번역기 네트워크 쪽 연결뿐이고, 그 컨테이너의 다른 네트워크(도면 분석기 쪽)는 건드리지 않는다.
+#   docker network inspect 는 실행 중인 컨테이너만 보여 주므로, 멈춘 모델 서버 컨테이너는 이름으로
+#   직접 확인해 뗀다 (남겨 두면 그 컨테이너를 다시 시작할 수 없게 된다).
 llm_unlink_all() {
-  local net name
-  for net in $(docker network ls -q --filter "label=$LABEL" 2>/dev/null); do
-    for name in $(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net" 2>/dev/null); do
-      [[ "$(docker inspect -f "{{index .Config.Labels \"$LABEL_KEY\"}}" "$name" 2>/dev/null)" == "1" ]] && continue
+  local net name names
+  for net in "$NET_INT" "$NET_PUB"; do
+    names=""
+    if ours_network "$net"; then
+      names=$(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$net" 2>/dev/null || true)
+    fi
+    if ! llm_external && llm_entry "$net" >/dev/null; then names="$names $LLM_CONTAINER"; fi
+    # shellcheck disable=SC2086  # 이름 목록을 낱말로 나눈다
+    for name in $(printf '%s\n' $names | sort -u); do
+      ours_container "$name" && continue
       if docker network disconnect "$net" "$name" >/dev/null 2>&1; then
         [[ "${1:-}" == "--quiet" ]] || ok "모델 서버 연결을 뗐습니다: $name (도면 분석기는 그대로)"
       fi
     done
   done
   return 0
+}
+
+# 네트워크가 정말 없어졌는지. 도커 데몬이 다시 시작되는 중이라 답하지 않는 것과 구별한다
+# (데몬이 답하고, 그래도 네트워크가 없을 때만 0)
+network_gone() {  # network_gone 네트워크
+  docker network inspect "$1" >/dev/null 2>&1 && return 1
+  docker info >/dev/null 2>&1 || return 1
+  ! docker network inspect "$1" >/dev/null 2>&1
 }
 
 # 도면 분석기가 다시 시작되어 모델 서버 컨테이너가 새로 만들어지면 자동으로 다시 붙이는 감시 프로세스
@@ -215,18 +317,25 @@ linker_pid() {
   echo "$pid"
 }
 linker_start() {
-  linker_stop
+  linker_stop || return 1
   mkd "$WS/logs" "$WS/state"
   setsid nohup bash "$WS/scripts/linker.sh" >> "$WS/logs/linker.log" 2>&1 < /dev/null &
   local i
   for ((i = 0; i < 20; i++)); do linker_pid >/dev/null && return 0; sleep 0.2; done
   return 1
 }
+# 감시 프로세스를 끝낸다. 끝내지 못하면(예: sudo 로 띄운 것을 sudo 없이 stop) 프로세스 번호 파일을
+# 남기고 1 을 돌려준다 (LINKER_ERR 에 프로세스 번호)
 linker_stop() {
-  local pid
+  local pid i sent=0
+  LINKER_ERR=""
   if pid=$(linker_pid); then
     # 감시 프로세스는 setsid 로 따로 묶여 있으므로 묶음째(docker events 포함) 끝낸다
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    if kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; then sent=1; fi
+    if ((sent)); then
+      for ((i = 0; i < 25; i++)); do linker_pid >/dev/null || break; sleep 0.2; done
+    fi
+    if linker_pid >/dev/null; then LINKER_ERR="$pid"; return 1; fi
   fi
   rm -f "$WS/state/linker.pid"
   return 0

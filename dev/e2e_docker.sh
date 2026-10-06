@@ -26,7 +26,7 @@ RUNNER_IMAGE="${E2E_RUNNER_IMAGE:-docker:29-cli}"
 PORT="${E2E_UI_PORT:-17870}"
 AUTH="${E2E_UI_AUTH:-0}"
 PASSWORD="${E2E_UI_PASSWORD:-}"
-LBL="translator.project=1"
+LBL="translator.project"   # 라벨 키만 본다 (값은 NAME_PREFIX: 어느 복사본의 것이든 남으면 안 된다)
 
 PASS=0; FAIL=0; NOTES=()
 pass() { printf '[PASS] %s\n' "$*"; PASS=$((PASS+1)); }
@@ -36,9 +36,9 @@ check() { local name="$1"; shift; if "$@"; then pass "$name"; else fail "$name";
 title() { printf '\n######## %s ########\n' "$*"; }
 indent() { sed 's/^/    /'; }
 
-R() {  # runner 안에서 run.sh 실행
+R() {  # runner 안에서 run.sh 실행 (E2E_ALLOW 로 UI_ALLOW 를 바꿔 볼 수 있다)
   docker exec -e TRANSLATOR_CONFIG_EXTRA=dev/e2e.env -e E2E_UI_PORT="$PORT" -e E2E_UI_AUTH="$AUTH" \
-    -e E2E_UI_PASSWORD="$PASSWORD" e2e-runner bash run.sh "$@"
+    -e E2E_UI_PASSWORD="$PASSWORD" -e E2E_UI_ALLOW="${E2E_ALLOW:-}" e2e-runner bash run.sh "$@"
 }
 
 fake_up() {
@@ -70,14 +70,18 @@ leftover_containers() { docker ps -aq --filter "label=$LBL"; }
 leftover_networks()   { docker network ls -q --filter "label=$LBL"; }
 # shellcheck disable=SC2329  # check 로 부른다
 linker_alive()        { docker exec e2e-runner pgrep -f 'scripts/linker[.]sh' >/dev/null; }   # pgrep 은 자기 자신을 빼고 찾는다
-export -f linker_alive
+# shellcheck disable=SC2329  # check 로 부른다
+events_alive()        { docker exec e2e-runner pgrep -f 'docker events --filter type=container' >/dev/null; }   # 감시 안의 docker events
+# shellcheck disable=SC2329  # wait_for 로 부른다
+followers_gone()      { ! docker exec e2e-runner pgrep -f 'docker logs -f' >/dev/null; }   # 화면 로그 옮겨 적기
+export -f linker_alive events_alive
 
 # ================================================================== 준비
 title "준비"
 cd "$REPO" || exit 1
 if ! docker info >/dev/null 2>&1; then echo "도커에 연결할 수 없습니다."; exit 1; fi
 if [[ -n "$(leftover_containers)$(leftover_networks)" ]]; then
-  echo "translator.project=1 라벨이 붙은 컨테이너·네트워크가 이미 있습니다. 먼저 정리하세요 (bash run.sh stop)."; exit 1
+  echo "translator.project 라벨이 붙은 컨테이너·네트워크가 이미 있습니다. 먼저 정리하세요 (bash run.sh stop)."; exit 1
 fi
 e2e_down
 PY_BEFORE=0; docker image inspect "$PY_IMAGE" >/dev/null 2>&1 && PY_BEFORE=1
@@ -117,6 +121,15 @@ check "앱 → http://llm:8000/v1/models" [ "$(app_llm_model)" == "Fake-Qwen" ]
 check "앱 컨테이너에서 인터넷 차단" bash -c "! docker exec translator-app python -c \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=3)\" 2>/dev/null"
 hard=$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.Config.User}} {{.HostConfig.SecurityOpt}}' translator-app)
 check "앱 컨테이너 읽기 전용·권한 최소 ($hard)" [ "$hard" == "true [ALL] 1000:1000 [no-new-privileges:true]" ]
+# shellcheck disable=SC2329  # check 로 부른다
+limits_ok() {  # limits_ok 컨테이너 → 메모리(스왑 없음)·프로세스 수·/tmp 크기 상한, 비정상 종료 시 다시 시작
+  local mem swap pids pol tmp
+  read -r mem swap pids pol tmp <<<"$(docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.PidsLimit}} {{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}} {{index .HostConfig.Tmpfs "/tmp"}}' "$1")"
+  printf '    %s: 메모리 %s · 스왑 포함 %s · 프로세스 %s · %s · /tmp %s\n' "$1" "$mem" "$swap" "$pids" "$pol" "$tmp"
+  (( mem > 0 && swap == mem && pids > 0 )) && [[ "$pol" == "on-failure:5" && "$tmp" == *size=* ]]
+}
+check "앱 컨테이너 자원 상한·자동 재시작" limits_ok translator-app
+check "중계기 자원 상한·자동 재시작" limits_ok translator-gate
 check "자동 재연결 감시 실행 중" linker_alive
 check "화면 로그가 logs/ 에 쌓임" docker exec e2e-runner grep -q "Application startup complete" logs/app_latest.log
 if [[ "$AUTH" == "1" ]]; then
@@ -138,6 +151,17 @@ title "status"
 out=$(R status 2>&1); echo "$out"
 check "status: 연결 표시" grep -q "번역기 내부 네트워크에 연결됨" <<<"$out"
 check "status: 모델 이름" grep -q "모델 Fake-Qwen" <<<"$out"
+
+title "UI_ALLOW (틀린 값은 시작 전에 막는다)"
+out=$(E2E_ALLOW="10.1.20.0/33" R start 2>&1); rc=$?; echo "$out" | indent
+check "틀린 UI_ALLOW 면 start 실패" [ "$rc" != 0 ]
+check "틀린 값 안내" grep -q "UI_ALLOW" <<<"$out"
+check "떠 있던 번역기는 그대로" bash -c "curl -fsS -m 10 http://127.0.0.1:$PORT/health | grep -q ok"
+out=$(E2E_ALLOW="0.0.0.0/0 ::/0" R start 2>&1); rc=$?
+check "올바른 UI_ALLOW 로 start" [ "$rc" == 0 ]
+check "허용 범위 안내" grep -q "접속 허용 범위: 0.0.0.0/0" <<<"$out"
+check "허용 범위 안에서 접속" bash -c "curl -fsS -m 10 http://127.0.0.1:$PORT/health | grep -q ok"
+check "다시 시작 후 앱 → 모델 서버" wait_for 20 app_llm_model
 
 title "selftest"
 if R selftest; then pass "run.sh selftest"
@@ -169,9 +193,14 @@ nets=$(fake_nets)
 check "가짜 모델 서버는 원래 네트워크만 ($nets)" [ "$nets" == "e2e-llm-net" ]
 check "가짜 모델 서버는 계속 실행 중" bash -c "[[ \"\$(docker inspect -f '{{.State.Running}}' e2e-fake-vllm)\" == true ]]"
 check "자동 재연결 감시 종료" bash -c "! linker_alive && docker exec e2e-runner test ! -e state/linker.pid"
+check "감시 안의 docker events 도 종료" bash -c "! events_alive"
+check "화면 로그 옮겨 적기 종료" wait_for 10 followers_gone
 
 title "clean --yes"
+docker exec e2e-runner sh -c 'mkdir -p data/jobs/e2e-leftover && echo x > data/jobs/e2e-leftover/input.txt'
 check "run.sh clean --yes" R clean --yes
+# shellcheck disable=SC2016  # runner 안의 sh 가 푼다
+check "clean 이 남은 문서(data/jobs)를 지움" docker exec e2e-runner sh -c '[ -d data/jobs ] && [ -z "$(ls -A data/jobs)" ]'
 if ((PY_BEFORE)); then
   check "원래 있던 $PY_IMAGE 는 남김" docker image inspect "$PY_IMAGE" >/dev/null
 fi

@@ -29,16 +29,26 @@ relink() {
 
 trap 'log "감시 끝"; exit 0' TERM INT HUP
 log "감시 시작: $LLM_CONTAINER (pid $$)"
+down=0; wait_s=5
 while true; do
   if ! docker network inspect "$NET_INT" >/dev/null 2>&1; then
-    log "네트워크 $NET_INT 가 없어 감시를 끝냅니다."
-    exit 0
+    if network_gone "$NET_INT"; then
+      log "네트워크 $NET_INT 가 없어 감시를 끝냅니다."
+      exit 0
+    fi
+    ((down)) || log "도커 데몬이 답하지 않습니다. 다시 답할 때까지 기다립니다."
+    down=1
+    sleep "$wait_s"
+    wait_s=$((wait_s * 2 > 60 ? 60 : wait_s * 2))
+    continue
   fi
+  if ((down)); then log "도커 데몬이 다시 답합니다."; down=0; wait_s=5; fi
   relink
+  # --foreground: timeout 이 따로 프로세스 묶음을 만들지 않게 해, stop 이 묶음째 끝낼 때 docker events 도 함께 끝난다
   while read -r _; do
     sleep 1   # 막 시작된 컨테이너가 자리 잡을 시간
     relink
-  done < <(timeout 300 docker events --filter type=container --filter event=start \
+  done < <(timeout --foreground 300 docker events --filter type=container --filter event=start \
              --filter "container=$LLM_CONTAINER" --format '{{.Actor.ID}}' 2>/dev/null)
   sleep 2
 done

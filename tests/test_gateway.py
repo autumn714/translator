@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from translator_app import gateway
 
 
@@ -83,3 +85,25 @@ def test_parse_allow():
     nets = gateway.parse_allow("10.1.20.0/24 10.1.21.15, 192.0.2.7/32")
     assert [str(n) for n in nets] == ["10.1.20.0/24", "10.1.21.15/32", "192.0.2.7/32"]
     assert gateway.parse_allow("") == []
+
+
+@pytest.mark.parametrize("bad", ["10.1.20.0/33", "10.1.20.*", "10.1.20.0/24 hello"])
+def test_parse_allow_names_the_bad_item(bad):
+    with pytest.raises(ValueError, match="UI_ALLOW") as e:
+        gateway.parse_allow(bad)
+    assert bad.split()[-1] in str(e.value)
+
+
+def test_check_mode_validates_allow_without_serving(capsys):
+    assert gateway.main(["--check", "--allow", "10.1.20.0/24, 10.1.21.15"]) == 0
+    assert gateway.main(["--check", "--allow", ""]) == 0
+    capsys.readouterr()
+    assert gateway.main(["--check", "--allow", "10.1.20.0/33"]) == 2
+    err = capsys.readouterr().err
+    assert "10.1.20.0/33" in err and "Traceback" not in err
+
+
+def test_serve_mode_with_bad_allow_exits_cleanly(capsys):
+    # 예전에는 ValueError 가 그대로 터져 중계기가 알아보기 힘든 오류로 죽었다
+    assert gateway.main(["--listen", "127.0.0.1:0", "--target", "127.0.0.1:1", "--allow", "10.1.20.*"]) == 2
+    assert "UI_ALLOW" in capsys.readouterr().err

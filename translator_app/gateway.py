@@ -6,6 +6,7 @@
 다른 곳으로 보내지 않는다. 목적지는 시작할 때 정한 한 곳으로 고정되어 있어 일반 프록시로 쓸 수 없다.
 
 python gateway.py --listen 0.0.0.0:7860 --target translator-app:7860 [--allow "10.1.20.0/24 10.1.21.15/32"]
+python gateway.py --check --allow "..."   허용 범위만 확인 (run.sh 가 시작 전에 쓴다)
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import argparse
 import asyncio
 import datetime as dt
 import ipaddress
+import sys
 
 
 def now() -> str:
@@ -20,8 +22,14 @@ def now() -> str:
 
 
 def parse_allow(text: str) -> list:
-    """띄어쓰기·쉼표로 구분한 주소 범위(CIDR) 목록. 비면 모두 허용."""
-    return [ipaddress.ip_network(x, strict=False) for x in text.replace(",", " ").split()]
+    """띄어쓰기·쉼표로 구분한 주소 범위(CIDR) 목록. 비면 모두 허용. 틀린 항목이 있으면 ValueError."""
+    nets = []
+    for item in text.replace(",", " ").split():
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            raise ValueError(f"접속 허용 범위(UI_ALLOW)에 올바르지 않은 값이 있습니다: {item}") from None
+    return nets
 
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -70,18 +78,32 @@ async def serve(listen: str, target: str, allow: str = "") -> asyncio.Server:
     return await asyncio.start_server(lambda r, w: handle(r, w, th, int(tp), nets), lh, int(lp))
 
 
-async def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--listen", default="0.0.0.0:7860")
-    ap.add_argument("--target", default="translator-app:7860")
-    ap.add_argument("--allow", default="", help="접속을 허용할 주소 범위(CIDR)를 띄어쓰기로 구분. 비우면 모두 허용")
-    a = ap.parse_args()
-    nets = parse_allow(a.allow)
-    srv = await serve(a.listen, a.target, a.allow)
-    print(f"{now()} 중계 시작: {a.listen} -> {a.target}" + (f" (허용: {', '.join(map(str, nets))})" if nets else ""), flush=True)
+async def run(listen: str, target: str, allow: str) -> None:
+    nets = parse_allow(allow)
+    srv = await serve(listen, target, allow)
+    print(f"{now()} 중계 시작: {listen} -> {target}" + (f" (허용: {', '.join(map(str, nets))})" if nets else ""), flush=True)
     async with srv:
         await srv.serve_forever()
 
 
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--listen", default="0.0.0.0:7860")
+    ap.add_argument("--target", default="translator-app:7860")
+    ap.add_argument("--allow", default="", help="접속을 허용할 주소 범위(CIDR)를 띄어쓰기로 구분. 비우면 모두 허용")
+    ap.add_argument("--check", action="store_true", help="허용 범위만 확인하고 끝낸다")
+    a = ap.parse_args(argv)
+    try:
+        nets = parse_allow(a.allow)
+    except ValueError as e:
+        print(str(e) if a.check else f"{now()} {e}", file=sys.stderr, flush=True)
+        return 2
+    if a.check:
+        print(f"허용 범위 {len(nets)}개 확인", flush=True)
+        return 0
+    asyncio.run(run(a.listen, a.target, a.allow))
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())
