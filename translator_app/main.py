@@ -1,219 +1,190 @@
+"""FastAPI application: wiring of settings, LLM client, translator service, routers and auth."""
 from __future__ import annotations
 
 import json
-import time
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from translator_app.config import get_settings
+from translator_app.auth import AuthMiddleware, LoginRateLimiter, SessionSigner
+from translator_app.config import Settings, get_settings
 from translator_app.engines.factory import build_engine
 from translator_app.languages import LANGUAGES
-from translator_app.schemas import (
-    DetectedLanguage,
-    GlossaryCreateRequest,
-    GlossaryDocument,
-    GlossaryListResponse,
-    GlossaryResponse,
-    GlossaryUpdateRequest,
-    TranslationRequest,
-    TranslationResponse,
-    TranslationSegment,
-)
-from translator_app.services.glossary import GlossaryStore, match_glossary_entries
-from translator_app.services.language_detection import detect_source_languages, resolve_source_language
-from translator_app.services.segmentation import normalize_line_breaks
+from translator_app.llm.client import LLMClient
+from translator_app.routers.glossaries import router as glossaries_router
+from translator_app.routers.system import APP_VERSION
+from translator_app.routers.system import router as system_router
+from translator_app.routers.translate import router as translate_router
+from translator_app.services.glossary import GlossaryStore
+from translator_app.services.translator import TranslatorService
+
+logger = logging.getLogger("translator")
+STATIC_DIR = Path(__file__).parent / "static"
 
 
-def create_app() -> FastAPI:
-    settings = get_settings()
-    engine = build_engine(settings)
-    glossary_store = GlossaryStore(settings.glossary_path)
+def _setup_logging() -> None:
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
-    app = FastAPI(title="Translator App", version="0.1.0")
-    if settings.cors_allow_origins:
+
+class BodySizeLimit:
+    """Reject requests whose Content-Length is obviously too large (413) before reading them."""
+
+    def __init__(self, app: ASGIApp, *, document_bytes: int, import_bytes: int, default_bytes: int) -> None:
+        self.app = app
+        self.document_bytes = document_bytes
+        self.import_bytes = import_bytes
+        self.default_bytes = default_bytes
+
+    def _limit(self, path: str) -> int:
+        if path.startswith("/api/documents"):
+            return self.document_bytes
+        if path.startswith("/api/glossaries/") and path.endswith("/import"):
+            return self.import_bytes
+        return self.default_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            for name, value in scope.get("headers") or []:
+                if name == b"content-length":
+                    try:
+                        length = int(value)
+                    except ValueError:
+                        length = 0
+                    if length > self._limit(scope.get("path", "")):
+                        body = json.dumps({"detail": "요청이 너무 큽니다."}, ensure_ascii=False).encode("utf-8")
+                        await send({"type": "http.response.start", "status": 413, "headers": [
+                            (b"content-type", b"application/json; charset=utf-8"),
+                            (b"content-length", str(len(body)).encode("ascii")),
+                            (b"connection", b"close"),
+                        ]})
+                        await send({"type": "http.response.body", "body": body})
+                        return
+                    break
+        await self.app(scope, receive, send)
+
+
+def _load_documents(settings: Settings, translator: TranslatorService) -> tuple[Any, Any]:
+    """Optional subsystem: text translation must work even if PyMuPDF / lxml are missing."""
+    try:
+        from translator_app.documents.jobs import JobManager
+        from translator_app.routers.documents import router as documents_router
+    except ImportError as exc:
+        logger.error("문서 번역 기능을 불러오지 못했습니다 (%s). 텍스트 번역만 제공합니다.", exc)
+        return None, None
+    try:
+        job_manager = JobManager(settings=settings, translator=translator)
+    except Exception:  # noqa: BLE001 - keep text translation available
+        logger.exception("문서 번역 작업 관리자를 시작하지 못했습니다. 텍스트 번역만 제공합니다.")
+        return None, None
+    return job_manager, documents_router
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    _setup_logging()
+    settings = settings or get_settings()
+    glossary_store = GlossaryStore(settings.glossary_file)
+    llm = None if settings.engine_type == "mock" else LLMClient(settings)
+    engine = build_engine(settings, llm)
+    translator = TranslatorService(settings, llm, engine, glossary_store)
+    job_manager, documents_router = _load_documents(settings, translator)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if job_manager is not None:
+            await job_manager.start()
+        logger.info(
+            "번역기 %s 시작 (엔진 %s, 모델 서버 %s, 문서 번역 %s, 로그인 %s)",
+            APP_VERSION,
+            engine.name,
+            settings.llm_base_url if llm is not None else "-",
+            "켜짐" if job_manager is not None else "꺼짐",
+            "켜짐" if settings.ui_auth else "꺼짐",
+        )
+        try:
+            yield
+        finally:
+            if job_manager is not None:
+                try:
+                    await job_manager.aclose()
+                except Exception:  # noqa: BLE001
+                    logger.exception("문서 작업 관리자 종료 중 오류")
+            await engine.aclose()
+            if llm is not None:
+                await llm.aclose()
+
+    app = FastAPI(title="번역기", version=APP_VERSION, lifespan=lifespan)
+    app.state.settings = settings
+    app.state.glossary_store = glossary_store
+    app.state.llm = llm
+    app.state.engine = engine
+    app.state.translator = translator
+    app.state.job_manager = job_manager
+    app.state.session_signer = SessionSigner(settings.session_key)
+    app.state.login_limiter = LoginRateLimiter()
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        fields = []
+        for error in exc.errors()[:3]:
+            location = [str(part) for part in error.get("loc", ()) if part not in ("body", "query", "path", "form")]
+            if location:
+                fields.append(".".join(location))
+        detail = "입력값이 올바르지 않습니다" + (f": {', '.join(fields)}" if fields else ".")
+        return JSONResponse(status_code=422, content={"detail": detail})
+
+    app.include_router(system_router)
+    app.include_router(translate_router)
+    app.include_router(glossaries_router)
+    if documents_router is not None:
+        app.include_router(documents_router)
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    serialized_languages = json.dumps(LANGUAGES, ensure_ascii=False).replace("<", "\\u003c")
+    index_path = STATIC_DIR / "index.html"
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def index() -> HTMLResponse:
+        template = index_path.read_text(encoding="utf-8")
+        return HTMLResponse(
+            template.replace("__TRANSLATOR_LANGUAGES__", serialized_languages),
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    # middleware: the last added runs first → size check, CORS, then the login gate
+    if settings.ui_auth:
+        if not settings.ui_password:
+            logger.error("UI_AUTH=1 이지만 UI_PASSWORD 가 비어 있어 아무도 로그인할 수 없습니다.")
+        app.add_middleware(AuthMiddleware, signer=app.state.session_signer, user=settings.ui_user)
+    if settings.cors_origin_list:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=settings.cors_allow_origins,
+            allow_origins=settings.cors_origin_list,
             allow_methods=["*"],
             allow_headers=["*"],
+            allow_credentials=True,
         )
-
-    static_dir = Path(__file__).parent / "static"
-    index_template = (static_dir / "index.html").read_text(encoding="utf-8")
-    serialized_languages = json.dumps(LANGUAGES, ensure_ascii=False).replace("<", "\\u003c")
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-    app.state.settings = settings
-    app.state.engine = engine
-    app.state.glossary_store = glossary_store
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        await engine.aclose()
-
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "engine": engine.name}
-
-    @app.get("/api/glossaries", response_model=GlossaryListResponse)
-    async def list_glossaries(request: Request) -> GlossaryListResponse:
-        store = request.app.state.glossary_store
-        return GlossaryListResponse(
-            glossaries=store.list_glossaries(),
-            default_glossary_id=store.default_glossary_id(),
-        )
-
-    @app.get("/api/glossaries/{glossary_id}", response_model=GlossaryResponse)
-    async def get_glossary(glossary_id: str, request: Request) -> GlossaryResponse:
-        glossary = request.app.state.glossary_store.load_glossary(glossary_id)
-        if glossary is None:
-            raise HTTPException(status_code=404, detail="Glossary not found")
-        return GlossaryResponse(glossary=glossary)
-
-    @app.post("/api/glossaries", response_model=GlossaryResponse, status_code=201)
-    async def create_glossary(
-        payload: GlossaryCreateRequest,
-        request: Request,
-    ) -> GlossaryResponse:
-        glossary = request.app.state.glossary_store.create_glossary(
-            name=payload.name,
-            entries=payload.entries,
-        )
-        return GlossaryResponse(glossary=glossary)
-
-    @app.put("/api/glossaries/{glossary_id}", response_model=GlossaryResponse)
-    async def update_glossary(
-        glossary_id: str,
-        payload: GlossaryUpdateRequest,
-        request: Request,
-    ) -> GlossaryResponse:
-        store = request.app.state.glossary_store
-        if store.load_glossary(glossary_id) is None:
-            raise HTTPException(status_code=404, detail="Glossary not found")
-        glossary = store.save_glossary(
-            GlossaryDocument(
-                id=glossary_id,
-                name=payload.name,
-                entries=payload.entries,
-            )
-        )
-        return GlossaryResponse(glossary=glossary)
-
-    @app.delete("/api/glossaries/{glossary_id}", status_code=204)
-    async def delete_glossary(glossary_id: str, request: Request) -> Response:
-        deleted = request.app.state.glossary_store.delete_glossary(glossary_id)
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Glossary not found")
-        return Response(status_code=204)
-
-    @app.get("/", response_class=HTMLResponse)
-    async def index() -> HTMLResponse:
-        return HTMLResponse(
-            index_template.replace("__TRANSLATOR_LANGUAGES__", serialized_languages)
-        )
-
-    @app.post("/api/translate", response_model=TranslationResponse)
-    async def translate(
-        payload: TranslationRequest,
-        request: Request,
-    ) -> TranslationResponse:
-        started = time.perf_counter()
-        translation_engine = request.app.state.engine
-        source_segments = translation_engine.segment_source_text(payload.text)
-        detection = detect_source_languages(payload.text)
-        resolved_source_lang = resolve_source_language(payload.source_lang, detection)
-        glossary_store = request.app.state.glossary_store
-        glossary_hits = []
-        glossary_applied = False
-        glossary_name = None
-
-        identity_shortcut = resolved_source_lang != "auto" and resolved_source_lang == payload.target_lang
-
-        if payload.use_glossary and not identity_shortcut:
-            glossary_entries = payload.glossary_entries
-            if payload.glossary_id:
-                glossary = glossary_store.load_glossary(payload.glossary_id)
-                if glossary is None:
-                    raise HTTPException(status_code=404, detail="Selected glossary was not found")
-                glossary_name = glossary.name
-                if glossary_entries is None:
-                    glossary_entries = glossary.entries
-
-            if glossary_entries is None:
-                glossary_entries = []
-
-            glossary_hits = match_glossary_entries(
-                payload.text,
-                glossary_entries,
-                target_lang=payload.target_lang,
-                source_lang=resolved_source_lang,
-            )
-            glossary_applied = bool(glossary_hits)
-
-        if identity_shortcut:
-            result = TranslationResponse(
-                translation=normalize_line_breaks(payload.text),
-                segments=[
-                    TranslationSegment(source=segment, target=segment)
-                    for segment in source_segments
-                ],
-                glossary_hits=[],
-                glossary_applied=False,
-                glossary_name=glossary_name,
-                detected_source_languages=[
-                    DetectedLanguage(
-                        code=item.code,
-                        char_count=item.char_count,
-                        share=item.share,
-                    )
-                    for item in detection.languages
-                ],
-                primary_source_lang=detection.primary_language,
-                source_language_mode=detection.mode,
-                engine=translation_engine.name,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-            return result
-
-        try:
-            result = await translation_engine.translate(
-                payload.text,
-                resolved_source_lang,
-                payload.target_lang,
-                glossary_hits,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        paired_segments = [
-            TranslationSegment(source=source, target=target)
-            for source, target in zip(source_segments, result.segments, strict=False)
-        ]
-        return TranslationResponse(
-            translation=result.translation,
-            segments=paired_segments,
-            glossary_hits=glossary_hits,
-            glossary_applied=glossary_applied,
-            glossary_name=glossary_name,
-            detected_source_languages=[
-                DetectedLanguage(
-                    code=item.code,
-                    char_count=item.char_count,
-                    share=item.share,
-                )
-                for item in detection.languages
-            ],
-            primary_source_lang=detection.primary_language,
-            source_language_mode=detection.mode,
-            engine=translation_engine.name,
-            latency_ms=latency_ms,
-        )
-
+    app.add_middleware(
+        BodySizeLimit,
+        document_bytes=(settings.doc_max_mb + 2) * 1024 * 1024,
+        import_bytes=6 * 1024 * 1024,
+        default_bytes=4 * 1024 * 1024,
+    )
     return app
 
 

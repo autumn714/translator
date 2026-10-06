@@ -1,317 +1,173 @@
+"""Engine backed by an OpenAI-compatible server (vLLM + Qwen3.8) through LLMClient."""
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
-
-import httpx
+import logging
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
 
 from translator_app.config import Settings
-from translator_app.engines.base import EngineResult, TranslationEngine
-from translator_app.languages import language_name
-from translator_app.schemas import GlossaryEntry
-from translator_app.services.glossary import match_glossary_entries
-from translator_app.services.segmentation import normalize_line_breaks, split_translation_units
+from translator_app.engines.base import TranslationEngine
+from translator_app.llm import prompts
+from translator_app.llm.client import (
+    ALTERNATIVES_SAMPLING,
+    JSON_SAMPLING,
+    MAX_COMPLETION_TOKENS,
+    OCR_MAX_COMPLETION_TOKENS,
+    OCR_SAMPLING,
+    RETRY_FINISH_REASONS,
+    REWRITE_SAMPLING,
+    TRANSLATE_SAMPLING,
+    LLMClient,
+    LLMOutputError,
+    VisionUnavailable,
+    completion_budget,
+    estimate_tokens,
+    image_data_uri,
+)
+from translator_app.llm.prompts import TranslationSpec
+
+logger = logging.getLogger("translator.engine")
+
+STRICT_SAMPLING = JSON_SAMPLING  # temperature 0, top_p 1.0, top_k -1
 
 
 class OpenAICompatibleEngine(TranslationEngine):
     name = "openai_compatible"
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, llm: LLMClient) -> None:
         self._settings = settings
-        self._client = httpx.AsyncClient(
-            timeout=120.0,
-            limits=httpx.Limits(max_keepalive_connections=32, max_connections=32),
-        )
-        self._segment_cache: OrderedDict[str, str] = OrderedDict()
-        self._inflight_translations: dict[str, asyncio.Task[str]] = {}
-        self._inflight_lock = asyncio.Lock()
+        self.llm = llm
+        # LLM_TEMPERATURE tunes plain/streamed translation; everything else follows SPEC §6a presets
+        self._translate_sampling = TRANSLATE_SAMPLING.with_(temperature=float(settings.llm_temperature))
 
-    async def translate(
+    async def translate_unit(
         self,
         text: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry] | None = None,
-    ) -> EngineResult:
-        units = split_translation_units(text, max_chars=self._settings.openai_chunk_chars)
-        if not units:
-            return EngineResult(translation="", segments=[])
-
-        parallelism = max(1, self._settings.openai_parallelism)
-        semaphore = asyncio.Semaphore(parallelism)
-        tasks = [
-            self._translate_segment(
-                client=self._client,
-                semaphore=semaphore,
-                index=index,
-                segment=unit,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                glossary_entries=glossary_entries or [],
-            )
-            for index, unit in enumerate(units)
-        ]
-        ordered = await asyncio.gather(*tasks)
-        ordered.sort(key=lambda item: item[0])
-        responses = [content for _, content in ordered]
-
-        translation = normalize_line_breaks("\n\n".join(content.strip() for content in responses))
-        return EngineResult(
-            translation=translation,
-            segments=responses,
-        )
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-    async def _translate_segment(
-        self,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        index: int,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
-    ) -> tuple[int, str]:
-        segment_glossary = match_glossary_entries(
-            segment,
-            glossary_entries,
-            target_lang=target_lang,
-            source_lang=source_lang,
-        )
-        cache_key = self._build_cache_key(segment, source_lang, target_lang, segment_glossary)
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return index, cached
-
-        content = await self._get_or_create_inflight_translation(
-            cache_key,
-            client=client,
-            semaphore=semaphore,
-            segment=segment,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            glossary_entries=segment_glossary,
-        )
-        return index, content
-
-    async def _get_or_create_inflight_translation(
-        self,
-        cache_key: str,
+        spec: TranslationSpec,
         *,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
+        priority: str = "interactive",
+        tags: bool = False,
+        strict_tags: str | None = None,
+        retry: bool = False,
     ) -> str:
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
+        messages = prompts.translation_messages(text, spec, tags=tags, strict_tags=strict_tags)
+        sampling = STRICT_SAMPLING if strict_tags else self._translate_sampling
+        budget = completion_budget(text)
+        if retry:
+            sampling = sampling.with_(presence_penalty=1.0)
+            budget = min(MAX_COMPLETION_TOKENS, budget * 2)
+        result = await self.llm.chat(
+            messages,
+            sampling=sampling,
+            max_tokens=budget,
+            priority=priority,
+            retry_truncated=not retry,
+        )
+        if result.finish_reason in RETRY_FINISH_REASONS:
+            logger.warning("번역 출력이 끊겼습니다 (%s, 원문 %d자)", result.finish_reason, len(text))
+        return result.content
 
-        async with self._inflight_lock:
-            cached = self._cache_get(cache_key)
-            if cached is not None:
-                return cached
-
-            task = self._inflight_translations.get(cache_key)
-            if task is None:
-                task = asyncio.create_task(
-                    self._request_segment_translation(
-                        client=client,
-                        semaphore=semaphore,
-                        segment=segment,
-                        source_lang=source_lang,
-                        target_lang=target_lang,
-                        glossary_entries=glossary_entries,
-                        cache_key=cache_key,
-                    )
-                )
-                self._inflight_translations[cache_key] = task
-
+    async def stream_unit(
+        self,
+        text: str,
+        spec: TranslationSpec,
+        *,
+        priority: str = "interactive",
+        meta: dict[str, Any] | None = None,
+    ) -> AsyncIterator[str]:
+        stream = self.llm.chat_stream(
+            prompts.translation_messages(text, spec),
+            sampling=self._translate_sampling,
+            max_tokens=completion_budget(text),
+            priority=priority,
+            meta=meta,
+        )
         try:
-            return await task
+            async for piece in stream:
+                yield piece
         finally:
-            async with self._inflight_lock:
-                if self._inflight_translations.get(cache_key) is task:
-                    self._inflight_translations.pop(cache_key, None)
+            await stream.aclose()  # closes the upstream response → vLLM aborts the request
 
-    async def _request_segment_translation(
+    async def translate_items(
         self,
+        items: Sequence[str],
+        spec: TranslationSpec,
         *,
-        client: httpx.AsyncClient,
-        semaphore: asyncio.Semaphore,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
-        cache_key: str,
-    ) -> str:
-        async with semaphore:
-            try:
-                response = await client.post(
-                    self._build_endpoint(),
-                    headers={
-                        "Authorization": f"Bearer {self._settings.openai_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=self._build_payload(segment, source_lang, target_lang, glossary_entries),
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = self._extract_content(data)
-                self._cache_put(cache_key, content)
-                return content
-            except httpx.HTTPStatusError as exc:
-                detail = exc.response.text.strip()
-                if not detail:
-                    detail = f"upstream returned HTTP {exc.response.status_code}"
-                raise RuntimeError(
-                    f"Model request failed with HTTP {exc.response.status_code}: {detail}"
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Model request failed: {exc}") from exc
-
-    def _build_endpoint(self) -> str:
-        base = self._settings.openai_base_url.rstrip("/")
-        if self._settings.openai_api_mode == "chat":
-            return f"{base}/chat/completions"
-        return f"{base}/completions"
-
-    def _build_payload(
-        self,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
-    ) -> dict:
-        language_block = self._build_language_block(source_lang, target_lang)
-        if self._settings.openai_api_mode == "chat":
-            return {
-                "model": self._settings.openai_model,
-                "temperature": self._settings.openai_temperature,
-                "max_tokens": self._settings.openai_max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._settings.openai_system_prompt},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"{language_block}\n"
-                            f"{self._build_glossary_block(glossary_entries)}"
-                            "Return only the translation.\n\n"
-                            f"{segment}"
-                        ),
-                    },
-                ],
-            }
-
-        return {
-            "model": self._settings.openai_model,
-            "temperature": self._settings.openai_temperature,
-            "max_tokens": self._settings.openai_max_tokens,
-            "prompt": self._build_completion_prompt(
-                segment,
-                source_lang,
-                target_lang,
-                glossary_entries,
-            ),
-        }
-
-    def _build_completion_prompt(
-        self,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
-    ) -> str:
-        source_name = self._language_name(source_lang)
-        target_name = self._language_name(target_lang)
-        target_tag = self._language_tag(target_lang)
-        if source_lang == "auto":
-            task_line = (
-                f"Detect the source language from the text and translate it into {target_name}. "
-            )
-        else:
-            task_line = f"Translate the following {source_name} sentence into {target_name}. "
-        return (
-            f"{self._settings.openai_system_prompt}\n"
-            f"{self._build_glossary_block(glossary_entries)}"
-            f"{task_line}"
-            "Return only the translation:\n"
-            f"{segment} <{target_tag}>"
+        priority: str = "document",
+        tags: bool = False,
+        preceding: Sequence[tuple[str, str]] | None = None,
+    ) -> list[str]:
+        count = len(items)
+        if count == 0:
+            return []
+        messages = prompts.batch_messages(items, spec, tags=tags, preceding=preceding)
+        source_tokens = sum(estimate_tokens(item) for item in items) + 12 * count
+        value = await self.llm.chat_json(
+            messages,
+            schema=prompts.batch_schema(count),
+            name="translations",
+            max_tokens=completion_budget(source_tokens),
+            sampling=JSON_SAMPLING,
+            priority=priority,
         )
+        rows = value["translations"]
+        ids = [row["id"] for row in rows]
+        if ids != list(range(count)):
+            if sorted(ids) != list(range(count)):
+                raise LLMOutputError("모델 응답의 항목 번호가 맞지 않습니다.")
+            rows = sorted(rows, key=lambda row: row["id"])
+        return [row["output"] for row in rows]
 
-    def _build_language_block(self, source_lang: str, target_lang: str) -> str:
-        target_name = self._language_name(target_lang)
-        if source_lang == "auto":
-            return (
-                "Source language: detect automatically from the input\n"
-                f"Target language: {target_name}"
-            )
-        return (
-            f"Source language: {self._language_name(source_lang)}\n"
-            f"Target language: {target_name}"
+    async def alternatives(self, source: str, translation: str, span: str, spec: TranslationSpec) -> list[str]:
+        count = prompts.ALTERNATIVES_COUNT
+        value = await self.llm.chat_json(
+            prompts.alternatives_messages(source, translation, span, spec, count),
+            schema=prompts.alternatives_schema(count),
+            name="alternatives",
+            max_tokens=completion_budget(estimate_tokens(span) * count + 16 * count),
+            sampling=ALTERNATIVES_SAMPLING,
+            priority="interactive",
         )
+        return [str(item) for item in value["alternatives"]]
 
-    def _build_glossary_block(self, glossary_entries: list[GlossaryEntry]) -> str:
-        if not glossary_entries:
-            return ""
-        lines = [
-            "Apply the following glossary exactly when the source term appears:",
-        ]
-        for entry in glossary_entries:
-            note = f" ({entry.note})" if entry.note else ""
-            lines.append(f"- {entry.source} => {entry.target}{note}")
-        return "\n".join(lines) + "\n"
+    async def rewrite(self, text: str, lang: str | None, style: str, context: str = "") -> str:
+        result = await self.llm.chat(
+            prompts.rewrite_messages(text, lang, style, context),
+            sampling=REWRITE_SAMPLING,
+            max_tokens=completion_budget(text),
+            priority="interactive",
+        )
+        return result.content
 
-    def _extract_content(self, data: dict) -> str:
-        choice = data["choices"][0]
-        if self._settings.openai_api_mode == "chat":
-            return choice["message"]["content"].strip()
-        return choice["text"].strip()
+    async def lookup(self, term: str, context: str, source_lang: str, target_lang: str) -> dict[str, Any]:
+        value = await self.llm.chat_json(
+            prompts.lookup_messages(term, context, source_lang, target_lang),
+            schema=prompts.LOOKUP_SCHEMA,
+            name="dictionary",
+            max_tokens=1024,
+            sampling=JSON_SAMPLING,
+            priority="interactive",
+        )
+        return value if isinstance(value, dict) else {}
 
-    def _build_cache_key(
+    async def describe_image(
         self,
-        segment: str,
-        source_lang: str,
-        target_lang: str,
-        glossary_entries: list[GlossaryEntry],
+        data: bytes,
+        mime: str,
+        spec: TranslationSpec,
+        *,
+        mode: str = "translate",
+        priority: str = "document",
     ) -> str:
-        glossary_key = "||".join(
-            f"{entry.source_lang}>{entry.target_lang}:{entry.source}=>{entry.target}|{entry.note}"
-            for entry in glossary_entries
+        if not self.llm.vision_enabled:
+            raise VisionUnavailable()
+        data_uri = await asyncio.to_thread(image_data_uri, data, mime)
+        result = await self.llm.chat(
+            prompts.image_messages(data_uri, spec, mode=mode),
+            sampling=OCR_SAMPLING,
+            max_tokens=OCR_MAX_COMPLETION_TOKENS,
+            priority=priority,
+            max_tokens_cap=OCR_MAX_COMPLETION_TOKENS,
         )
-        return "\x1f".join((source_lang, target_lang, segment, glossary_key))
-
-    def _cache_get(self, key: str) -> str | None:
-        cached = self._segment_cache.get(key)
-        if cached is None:
-            return None
-        self._segment_cache.move_to_end(key)
-        return cached
-
-    def _cache_put(self, key: str, value: str) -> None:
-        self._segment_cache[key] = value
-        self._segment_cache.move_to_end(key)
-        max_size = max(0, self._settings.openai_segment_cache_size)
-        while len(self._segment_cache) > max_size:
-            self._segment_cache.popitem(last=False)
-
-    def _language_name(self, code: str) -> str:
-        if code == "auto":
-            return "Auto"
-        return language_name(code)
-
-    def _language_tag(self, code: str) -> str:
-        tags = {
-            "en": "en",
-            "ko": "ko",
-            "ja": "ja",
-            "zh": "zh",
-        }
-        return tags.get(code, code)
-
-    def segment_source_text(self, text: str) -> list[str]:
-        return split_translation_units(text, max_chars=self._settings.openai_chunk_chars)
+        return result.content

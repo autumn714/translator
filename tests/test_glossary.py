@@ -73,3 +73,51 @@ def test_invalid_default_is_recreated_during_startup(tmp_path) -> None:
     assert default_glossary.id == "default"
     assert default_glossary.entries == []
     assert len(list(root.glob("default.json.invalid-*.bak"))) == 1
+
+
+def test_valid_existing_default_file_is_never_rewritten(tmp_path) -> None:
+    root = tmp_path / "glossary"
+    root.mkdir(parents=True)
+    seed = root / "default.json"
+    raw = rb'{"id": "default", "name": "seed", "entries": [{"source": "H2", "target": "H\u2082"}]}'
+    seed.write_bytes(raw)
+
+    store = GlossaryStore(seed)
+    store.list_glossaries()
+    assert seed.read_bytes() == raw
+    assert store.load_glossary("default").entries[0].target == "H\u2082"
+
+
+def test_saved_files_end_with_a_newline_and_use_lf(tmp_path) -> None:
+    store = GlossaryStore(tmp_path / "glossary" / "default.json")
+    created = store.create_glossary(name="x", entries=[GlossaryEntry(source="a", target="b")])
+    data = (tmp_path / "glossary" / f"{created.id}.json").read_bytes()
+    assert data.endswith(b"}\n") and b"\r\n" not in data
+    assert not list((tmp_path / "glossary").glob("*.tmp"))
+
+
+def test_parse_import_variants() -> None:
+    from translator_app.services.glossary import GlossaryImportError, merge_entries, parse_import
+
+    with_header = parse_import("source,target,note\nfuel cell,연료전지,\"a, b\"\n".encode(), "x.csv")
+    assert [(e.source, e.target, e.note) for e in with_header] == [("fuel cell", "연료전지", "a, b")]
+
+    korean_header = parse_import("원문\t번역\t사용\n수소\thydrogen\t미사용\n".encode("cp949"), "x.tsv",
+                                 default_source_lang="ko", default_target_lang="en")
+    assert korean_header[0].source == "수소" and korean_header[0].enabled is False
+    assert (korean_header[0].source_lang, korean_header[0].target_lang) == ("ko", "en")
+
+    langs_first = parse_import(b"en\tja\tplant\t\xe3\x83\x97\xe3\x83\xa9\xe3\x83\xb3\xe3\x83\x88\t\ttrue\n", "x.txt")
+    assert (langs_first[0].source_lang, langs_first[0].target_lang, langs_first[0].source) == ("en", "ja", "plant")
+
+    for bad in (b"", b"only-one-column\n", b"source,target\n,missing\n"):
+        try:
+            parse_import(bad, "x.csv")
+        except GlossaryImportError:
+            pass
+        else:  # pragma: no cover
+            raise AssertionError(bad)
+
+    existing = [GlossaryEntry(source="Grid", target="old"), GlossaryEntry(source="keep", target="k")]
+    merged = merge_entries(existing, [GlossaryEntry(source="grid", target="new"), GlossaryEntry(source="n", target="m")])
+    assert [(e.source, e.target) for e in merged] == [("grid", "new"), ("keep", "k"), ("n", "m")]
