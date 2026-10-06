@@ -1480,6 +1480,20 @@ textarea.input {
   background: var(--accent-weak);
 }
 
+.dropzone.is-disabled {
+  border-color: var(--border);
+  cursor: default;
+}
+
+.dropzone.is-disabled .dz-icon {
+  background: var(--surface);
+  color: var(--text-4);
+}
+
+.dropzone.is-disabled .dz-title {
+  color: var(--text-3);
+}
+
 .dz-icon {
   display: grid;
   place-items: center;
@@ -2245,51 +2259,6 @@ textarea.input {
   font-size: 12px;
 }
 
-/* status popover */
-.status-pop {
-  min-width: 260px;
-}
-
-.kv {
-  margin: 0;
-  padding: 0 8px;
-}
-
-.kv-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 5px 0;
-  font-size: 13.5px;
-}
-
-.kv-row + .kv-row {
-  border-top: 1px solid var(--divider);
-}
-
-.kv-row dt {
-  color: var(--text-3);
-}
-
-.kv-row dd {
-  margin: 0;
-  font-weight: 600;
-  text-align: right;
-  overflow-wrap: anywhere;
-}
-
-.kv-ok dd {
-  color: var(--success);
-}
-
-.kv-busy dd {
-  color: var(--warning);
-}
-
-.kv-down dd {
-  color: var(--danger);
-}
-
 /* keyboard */
 .pop-kbd {
   min-width: 300px;
@@ -2642,6 +2611,24 @@ dialog {
 .select-cell:hover:not(:disabled) {
   border-color: var(--border);
   background-color: var(--surface);
+}
+
+.gl-table tbody tr.is-invalid td {
+  background: var(--danger-weak);
+}
+
+.cell-input[aria-invalid] {
+  border-color: var(--danger);
+  background: var(--surface);
+}
+
+.cell-input[aria-invalid]::placeholder {
+  color: var(--danger);
+}
+
+.gl-more {
+  display: flex;
+  margin: 8px auto;
 }
 
 .row-del {

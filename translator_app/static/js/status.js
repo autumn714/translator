@@ -1,6 +1,5 @@
 import { api } from "./api.js";
-import { $, h, fmtNum, toast } from "./dom.js";
-import { openPopover, closePopover, isPopoverFor } from "./popover.js";
+import { $, fmtNum, toast } from "./dom.js";
 
 const POLL_MS = 15000;
 
@@ -34,6 +33,7 @@ const DEFAULT_STATUS = {
 
 let current = null;
 let loaded = false;
+let checking = false;
 const listeners = new Set();
 
 export const getStatus = () => current || DEFAULT_STATUS;
@@ -43,25 +43,26 @@ export function onStatus(listener) {
   if (current) listener(current);
 }
 
-function merge(data) {
+// An explicit empty document_formats means the document feature is unavailable; only a missing field falls back.
+export function mergeStatus(data) {
   return {
     ...DEFAULT_STATUS,
     ...data,
     model: { ...DEFAULT_STATUS.model, ...(data?.model || {}) },
     auth: { ...DEFAULT_STATUS.auth, ...(data?.auth || {}) },
     limits: { ...DEFAULT_STATUS.limits, ...(data?.limits || {}) },
-    document_formats: Array.isArray(data?.document_formats) && data.document_formats.length ? data.document_formats : DEFAULT_FORMATS,
+    document_formats: Array.isArray(data?.document_formats) ? data.document_formats : DEFAULT_FORMATS,
   };
 }
 
 export async function refreshStatus() {
   try {
-    current = merge(await api("/api/status"));
+    current = mergeStatus(await api("/api/status"));
     current.unreachable = false;
   } catch (error) {
     if (error?.status === 401) return;
     const previous = current || DEFAULT_STATUS;
-    current = merge({
+    current = mergeStatus({
       ...previous,
       model: { ...previous.model, connected: false, error: error?.message || "서버에 연결할 수 없습니다." },
     });
@@ -72,10 +73,10 @@ export async function refreshStatus() {
   listeners.forEach((listener) => listener(current));
 }
 
+// Only the connection state is shown (no model name, context length or version).
 function chipState(status) {
-  if (!loaded) return { state: "loading", label: "확인 중" };
-  if (status.unreachable) return { state: "down", label: "서버 연결 안 됨" };
-  if (!status.model.connected) return { state: "down", label: "모델 연결 안 됨" };
+  if (!loaded || checking) return { state: "loading", label: "확인 중" };
+  if (status.unreachable || !status.model.connected) return { state: "down", label: "연결 안 됨" };
   if (Number(status.model.waiting) > 0) return { state: "busy", label: `대기 ${fmtNum(status.model.waiting)}건` };
   return { state: "ok", label: "연결됨" };
 }
@@ -87,9 +88,8 @@ function render() {
   const { state, label } = chipState(status);
   chip.dataset.state = state;
   chip.querySelector(".status-label").textContent = label;
-  const tooltip = status.model.connected ? status.model.name || "모델" : status.model.error || label;
-  chip.setAttribute("aria-label", `모델 상태: ${label}`);
-  chip.dataset.tip = tooltip;
+  chip.setAttribute("aria-label", `서버 상태: ${label} · 다시 확인`);
+  chip.dataset.tip = "다시 확인";
 
   const logout = $("#logoutBtn");
   if (logout) {
@@ -98,61 +98,24 @@ function render() {
     logout.dataset.tip = user;
     logout.setAttribute("aria-label", user);
   }
-  if (isPopoverFor(chip)) openDetails(chip);
 }
 
-function row(label, value, cls = "") {
-  return h("div", { class: `kv-row ${cls}`.trim() }, h("dt", { text: label }), h("dd", { text: value }));
-}
-
-function openDetails(chip) {
-  const status = getStatus();
-  const model = status.model;
-  const { label } = chipState(status);
-  const dash = "–";
-  const list = h(
-    "dl",
-    { class: "kv" },
-    row("상태", label, `kv-state kv-${chip.dataset.state}`),
-    row("모델", model.name || dash),
-    row("처리 중", model.running == null ? dash : `${fmtNum(model.running)}건`),
-    row("대기", model.waiting == null ? dash : `${fmtNum(model.waiting)}건`),
-    row("최대 길이", model.max_model_len ? `${fmtNum(model.max_model_len)} 토큰` : dash),
-    row("이미지 인식", model.vision ? "지원" : "미지원"),
-    status.app_version ? row("버전", status.app_version) : null,
-  );
-  const content = h(
-    "div",
-    { class: "status-pop" },
-    h("div", { class: "pop-head" }, h("span", { class: "pop-title", text: "모델 서버" })),
-    list,
-    !model.connected && model.error ? h("p", { class: "pop-error", text: model.error }) : null,
-    h(
-      "div",
-      { class: "pop-actions" },
-      h(
-        "button",
-        {
-          type: "button",
-          class: "btn btn-sm",
-          onclick: async () => {
-            await refreshStatus();
-            toast("상태를 갱신했습니다", { type: "info", timeout: 1400 });
-          },
-        },
-        "다시 확인",
-      ),
-    ),
-  );
-  openPopover({ anchor: chip, content, className: "pop-status", label: "모델 상태", align: "end" });
+async function recheck() {
+  if (checking) return;
+  checking = true;
+  render();
+  try {
+    await refreshStatus();
+  } finally {
+    checking = false;
+    render();
+  }
+  const { state, label } = chipState(getStatus());
+  toast(label, { type: state === "down" ? "error" : "info", timeout: 1600 });
 }
 
 export function initStatus() {
-  const chip = $("#statusChip");
-  chip?.addEventListener("click", () => {
-    if (isPopoverFor(chip)) closePopover();
-    else openDetails(chip);
-  });
+  $("#statusChip")?.addEventListener("click", recheck);
   $("#logoutBtn")?.addEventListener("click", async () => {
     try {
       await api("/api/logout", { method: "POST" });

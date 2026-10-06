@@ -6,6 +6,8 @@ import { diffWords, countChanges } from "./diff.js";
 
 const KEY = "translator.write";
 const MAX_CHARS = 10000;
+// Style changes re-run a shown result only after the user settles on a style (arrow keys/chip clicks in a row).
+const STYLE_DEBOUNCE_MS = 600;
 const STYLES = [
   ["polish", "다듬기"],
   ["formal", "격식"],
@@ -22,6 +24,7 @@ const W = {
   style: "polish",
   showDiff: true,
   controller: null,
+  styleTimer: 0,
   busy: false,
   before: "",
   after: "",
@@ -116,7 +119,34 @@ function showError(message) {
   );
 }
 
+// Aborting the fetch also cancels the request on the server (it stops when the client disconnects).
+function cancelRewrite() {
+  clearTimeout(W.styleTimer);
+  W.styleTimer = 0;
+  W.controller?.abort();
+  W.controller = null;
+  setBusy(false);
+}
+
+function scheduleStyleRewrite() {
+  clearTimeout(W.styleTimer);
+  W.styleTimer = 0;
+  const inFlight = Boolean(W.controller);
+  if (!(W.hasResult || inFlight) || !el.input.value.trim()) return;
+  if (inFlight) {
+    W.controller.abort();
+    W.controller = null;
+  }
+  if (W.hasResult) el.out.classList.add("is-stale");
+  W.styleTimer = setTimeout(() => {
+    W.styleTimer = 0;
+    runRewrite();
+  }, STYLE_DEBOUNCE_MS);
+}
+
 export async function runRewrite() {
+  clearTimeout(W.styleTimer);
+  W.styleTimer = 0;
   const text = el.input.value;
   if (!text.trim()) return;
   if (text.length > MAX_CHARS) {
@@ -206,11 +236,12 @@ export function initWrite() {
   el.styles.addEventListener("click", (event) => {
     const chip = event.target.closest(".chip");
     if (!chip) return;
+    if (chip.dataset.value === W.style) return;
     W.style = chip.dataset.value;
     renderStyles();
     el.styles.querySelector(`[data-value="${W.style}"]`)?.focus();
     saveSettings();
-    if (W.hasResult && el.input.value.trim()) runRewrite();
+    scheduleStyleRewrite();
   });
   el.styles.addEventListener("keydown", (event) => {
     if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
@@ -228,9 +259,7 @@ export function initWrite() {
     autoGrow();
     if (W.hasResult) el.out.classList.toggle("is-stale", el.input.value !== W.before);
     if (!el.input.value.trim()) {
-      W.controller?.abort();
-      W.controller = null;
-      setBusy(false);
+      cancelRewrite();
       W.hasResult = false;
       W.before = W.after = "";
       setAutoOptionLabel(el.lang, AUTO_LABEL);

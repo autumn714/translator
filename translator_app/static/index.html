@@ -35,7 +35,7 @@
         </nav>
 
         <div class="topbar-actions">
-          <button id="statusChip" class="status-chip tip tip-below tip-end" type="button" data-state="loading" aria-haspopup="dialog" data-tip="확인 중">
+          <button id="statusChip" class="status-chip tip tip-below tip-end" type="button" data-state="loading" aria-label="서버 상태: 확인 중" data-tip="다시 확인">
             <span class="status-dot" aria-hidden="true"></span><span class="status-label">확인 중</span>
           </button>
           <button id="historyBtn" class="icon-btn tip tip-below" type="button" aria-label="번역 기록" data-tip="번역 기록">
@@ -110,6 +110,7 @@
               <div class="busy-line" id="busyLine" hidden></div>
               <div id="outText" class="out-text" role="textbox" aria-multiline="true" aria-label="번역 결과" aria-readonly="true" spellcheck="false"></div>
               <div id="outPlaceholder" class="out-placeholder" aria-hidden="true">번역</div>
+              <div id="outStatus" class="sr-only" role="status" aria-live="polite"></div>
               <div class="pane-foot out-foot" id="outFoot" hidden>
                 <div class="foot-left">
                   <button id="hitsChip" class="mini-chip" type="button" hidden>

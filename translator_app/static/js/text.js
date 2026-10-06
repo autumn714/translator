@@ -37,6 +37,13 @@ const KEYS = {
 const CONTEXT_MAX = 4000;
 const RULES_MAX = 2000;
 const PARA_SPLIT = /\n[ \t]*\n/;
+// Alternatives open only after the pointer settles; long paragraphs are cut to a window around the span
+// (the API caps source/translation at 20,000 chars).
+const ALT_DELAY_MS = 300;
+const ALT_CONTEXT = 1500;
+const ALT_TRANSLATION_MAX = 4000;
+const ALT_SOURCE_MAX = 6000;
+const ALT_CACHE_MAX = 30;
 
 const el = {};
 const S = {
@@ -56,10 +63,13 @@ const S = {
   prev: { key: "", map: new Map() },
   pinned: null,
   altController: null,
+  altTimer: 0,
+  editing: false,
   lookupController: null,
   speaking: false,
 };
 const paraSource = new WeakMap();
+const altCache = new Map();
 const speechSupported = "speechSynthesis" in window && typeof window.SpeechSynthesisUtterance === "function";
 const highlightSupported = typeof CSS !== "undefined" && CSS.highlights && typeof window.Highlight === "function";
 let onFiles = () => {};
@@ -81,7 +91,7 @@ function resolvedSource() {
   return S.detected?.primary && isLanguage(S.detected.primary) ? S.detected.primary : "auto";
 }
 
-function requestOptions() {
+function requestOptions(text) {
   const glossaryId = glossaryState.activeId;
   const useGlossary = Boolean(glossaryState.enabled && glossaryId);
   return {
@@ -92,7 +102,7 @@ function requestOptions() {
     instructions: el.rules.value.trim().slice(0, RULES_MAX),
     use_glossary: useGlossary,
     glossary_id: useGlossary ? glossaryId : null,
-    glossary_entries: useGlossary ? draftEntries() : null,
+    glossary_entries: useGlossary ? draftEntries(text) : null,
   };
 }
 
@@ -103,6 +113,13 @@ function setHighlight(name, range) {
   if (!highlightSupported) return;
   if (range) CSS.highlights.set(name, new window.Highlight(range));
   else CSS.highlights.delete(name);
+}
+
+// Screen-reader status for the output (role=status, aria-live=polite).
+function announce(message) {
+  if (!el.live) return;
+  el.live.textContent = "";
+  if (message) setTimeout(() => (el.live.textContent = message), 60);
 }
 
 function flashIcon(button, name) {
@@ -255,7 +272,7 @@ async function run() {
     showError(`최대 ${fmtNum(limit)}자까지 번역할 수 있습니다.`, { retry: false });
     return;
   }
-  const opts = requestOptions();
+  const opts = requestOptions(text);
   const key = optionsKey(opts);
   if (S.pinned && S.pinned.key !== key) S.pinned = null;
   if (S.pinned && renderPinnedOnly(text)) return;
@@ -279,6 +296,7 @@ async function run() {
   S.controller = controller;
   const id = S.reqId;
   S.current = { text: sendText, fullText: text, layout, opts, key, started: false };
+  announce("");
   setPhase("streaming");
   updateFoot();
   try {
@@ -489,6 +507,7 @@ function splitPairs(source, target) {
 
 function renderFinal(finals) {
   S.finals = finals;
+  S.editing = false;
   const nodes = finals.map((pair) => {
     const node = h("div", { class: "para" });
     node.textContent = pair.target;
@@ -528,6 +547,7 @@ function finalize(event) {
   renderFinal(finals);
   setPhase("done");
   updateFoot();
+  announce("번역 완료");
   if (!el.segPanel.hidden) renderSegments();
   recordTranslation({
     source: current.fullText,
@@ -621,6 +641,7 @@ function resetOutput() {
   updateFoot();
   if (!el.segPanel.hidden) renderSegments();
   stopSpeaking();
+  cancelPendingAlternatives();
   closeAltPopover();
 }
 
@@ -971,29 +992,100 @@ function sentenceBounds(text, position) {
   return [start, end];
 }
 
-function onOutputPointerUp() {
+// Alternatives cost an LLM call, so they open only on an explicit action: a primary-button click on a sentence
+// (not a caret move while the user is editing the output) or a real selection, once the pointer has settled.
+function cancelPendingAlternatives() {
+  clearTimeout(S.altTimer);
+  S.altTimer = 0;
+}
+
+function scheduleAlternatives({ selectionOnly = false } = {}) {
+  cancelPendingAlternatives();
   if (S.phase !== "done") return;
-  setTimeout(() => {
-    const selection = window.getSelection();
-    if (!selection || !selection.rangeCount) return;
-    const range = selection.getRangeAt(0);
-    if (!el.out.contains(range.commonAncestorContainer)) return;
-    const para = closestPara(range.startContainer);
-    if (!para || para !== closestPara(range.endContainer)) return;
-    const text = para.textContent;
-    if (!text.trim()) return;
-    let [start, end] = rangeOffsets(para, range);
-    if (start === end) {
-      [start, end] = sentenceBounds(text, start);
-    } else {
-      while (start < end && /\s/.test(text[start])) start += 1;
-      while (end > start && /\s/.test(text[end - 1])) end -= 1;
-    }
-    if (end <= start || end - start > 800) return;
-    const span = text.slice(start, end);
-    if (!/[\p{L}\p{N}]/u.test(span)) return;
-    openAlternatives(para, start, end, span);
-  }, 0);
+  S.altTimer = setTimeout(() => {
+    S.altTimer = 0;
+    openFromSelection(selectionOnly);
+  }, ALT_DELAY_MS);
+}
+
+function onOutputMouseUp(event) {
+  if (event.button !== 0) return;
+  scheduleAlternatives();
+}
+
+function openFromSelection(selectionOnly) {
+  if (S.phase !== "done") return;
+  const selection = window.getSelection();
+  if (!selection || !selection.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  if (!el.out.contains(range.commonAncestorContainer)) return;
+  const para = closestPara(range.startContainer);
+  if (!para || para !== closestPara(range.endContainer)) return;
+  const text = para.textContent;
+  if (!text.trim()) return;
+  let [start, end] = rangeOffsets(para, range);
+  if (start === end) {
+    if (selectionOnly || S.editing) return;
+    [start, end] = sentenceBounds(text, start);
+  } else {
+    while (start < end && /\s/.test(text[start])) start += 1;
+    while (end > start && /\s/.test(text[end - 1])) end -= 1;
+  }
+  if (end <= start || end - start > 800) return;
+  const span = text.slice(start, end);
+  if (!/[\p{L}\p{N}]/u.test(span)) return;
+  openAlternatives(para, start, end, span);
+}
+
+function snapStart(text, from, limit) {
+  if (from <= 0) return 0;
+  const line = text.indexOf("\n", from);
+  if (line >= 0 && line < limit) return line + 1;
+  const stop = Math.min(limit, from + 200);
+  for (let index = from; index < stop; index += 1) if (/\s/.test(text[index])) return index + 1;
+  return from;
+}
+
+function snapEnd(text, to, limit) {
+  if (to >= text.length) return text.length;
+  const line = text.lastIndexOf("\n", to - 1);
+  if (line >= limit) return line;
+  const stop = Math.max(limit, to - 200);
+  for (let index = to - 1; index >= stop; index -= 1) if (/\s/.test(text[index])) return index;
+  return to;
+}
+
+// Source/translation sent with an alternatives request: whole paragraphs when short, otherwise a window
+// around the span (translation) and around the proportional position (source).
+function alternativesContext(source, translation, start, end) {
+  let windowSource = source;
+  let windowTranslation = translation;
+  if (translation.length > ALT_TRANSLATION_MAX) {
+    const from = snapStart(translation, Math.max(0, start - ALT_CONTEXT), start);
+    const to = snapEnd(translation, Math.min(translation.length, end + ALT_CONTEXT), end);
+    windowTranslation = translation.slice(from, to);
+  }
+  if (source.length > ALT_SOURCE_MAX) {
+    const center = Math.round(((start + end) / 2 / Math.max(1, translation.length)) * source.length);
+    const to = Math.min(source.length, Math.max(0, center - ALT_SOURCE_MAX / 2) + ALT_SOURCE_MAX);
+    const from = Math.max(0, to - ALT_SOURCE_MAX);
+    const middle = Math.min(Math.max(center, from), to);
+    windowSource = source.slice(snapStart(source, from, middle), snapEnd(source, to, middle));
+  }
+  return { source: windowSource, translation: windowTranslation };
+}
+
+function cachedAlternatives(key) {
+  if (!altCache.has(key)) return null;
+  const value = altCache.get(key);
+  altCache.delete(key);
+  altCache.set(key, value);
+  return value;
+}
+
+function rememberAlternatives(key, value) {
+  altCache.set(key, value);
+  while (altCache.size > ALT_CACHE_MAX) altCache.delete(altCache.keys().next().value);
 }
 
 function applyAlternative(para, start, end, span, replacement) {
@@ -1061,7 +1153,8 @@ function openGlossaryForm(pop, span) {
     try {
       await addGlossaryEntry({ source_lang: sourceLang, target_lang: targetLang, source: sourceText, target: targetText, note: "", enabled: true });
       closePopover();
-      toast(`용어집에 추가했습니다: ${sourceText} → ${targetText}`);
+      const off = glossaryState.enabled ? "" : " (적용 꺼짐)";
+      toast(`용어집에 추가했습니다${off}: ${sourceText} → ${targetText}`);
     } catch (err) {
       error.textContent = err.message;
       error.hidden = false;
@@ -1101,21 +1194,24 @@ function openAlternatives(para, start, end, span) {
   });
   addButton.addEventListener("click", () => openGlossaryForm(pop, span));
   enableListNavigation(list, ".alt-item");
+  const context = alternativesContext(paraSource.get(para) ?? S.result?.sourceText ?? "", para.textContent, start, end);
+  const payload = {
+    ...requestOptions(context.source),
+    source_lang: resolvedSource(),
+    source: context.source,
+    translation: context.translation,
+    span,
+  };
+  const cacheKey = JSON.stringify(payload);
   const load = async () => {
     list.replaceChildren(skeletonLines(3, { lastWidth: 70 }));
     pop.update();
     try {
-      const data = await api("/api/alternatives", {
-        method: "POST",
-        json: {
-          ...requestOptions(),
-          source_lang: resolvedSource(),
-          source: paraSource.get(para) ?? S.result?.sourceText ?? "",
-          translation: para.textContent,
-          span,
-        },
-        signal: controller.signal,
-      });
+      let data = cachedAlternatives(cacheKey);
+      if (!data) {
+        data = await api("/api/alternatives", { method: "POST", json: payload, signal: controller.signal });
+        if (Array.isArray(data?.alternatives) && data.alternatives.length) rememberAlternatives(cacheKey, data);
+      }
       if (currentPopover() !== pop) return;
       const seen = new Set([span.trim()]);
       const alternatives = (Array.isArray(data?.alternatives) ? data.alternatives : [])
@@ -1327,6 +1423,7 @@ export function initText({ onFilesDropped }) {
     clear: $("#clearBtn"),
     count: $("#srcCount"),
     out: $("#outText"),
+    live: $("#outStatus"),
     placeholder: $("#outPlaceholder"),
     busy: $("#busyLine"),
     foot: $("#outFoot"),
@@ -1377,7 +1474,11 @@ export function initText({ onFilesDropped }) {
     if (reason === "draft" || reason === "load") return;
     // A term added from the output only re-translates when it applies to the current text (keeps manual edits otherwise).
     if (reason === "entries" && entry) {
-      const applies = entry.target_lang === el.tgtLang.value && el.src.value.toLowerCase().includes(String(entry.source || "").toLowerCase());
+      const applies =
+        glossaryState.enabled &&
+        Boolean(glossaryState.activeId) &&
+        entry.target_lang === el.tgtLang.value &&
+        el.src.value.toLowerCase().includes(String(entry.source || "").toLowerCase());
       if (!applies) return;
     }
     scheduleIfText(0);
@@ -1413,9 +1514,10 @@ export function initText({ onFilesDropped }) {
     scheduleIfText(0);
   });
 
-  el.out.addEventListener("mouseup", onOutputPointerUp);
+  el.out.addEventListener("pointerdown", cancelPendingAlternatives);
+  el.out.addEventListener("mouseup", onOutputMouseUp);
   el.out.addEventListener("keyup", (event) => {
-    if (event.shiftKey && event.key.startsWith("Arrow")) onOutputPointerUp();
+    if (event.shiftKey && event.key.startsWith("Arrow")) scheduleAlternatives({ selectionOnly: true });
   });
   el.out.addEventListener("keydown", (event) => {
     if (event.altKey && event.key === "ArrowDown") {
@@ -1426,7 +1528,14 @@ export function initText({ onFilesDropped }) {
       }
     }
   });
-  el.out.addEventListener("input", () => closeAltPopover());
+  el.out.addEventListener("input", () => {
+    S.editing = true;
+    cancelPendingAlternatives();
+    closeAltPopover();
+  });
+  el.out.addEventListener("focusout", (event) => {
+    if (!el.out.contains(event.relatedTarget)) S.editing = false;
+  });
   el.out.addEventListener("paste", (event) => {
     if (el.out.contentEditable !== "true") return;
     event.preventDefault();

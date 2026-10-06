@@ -22,11 +22,12 @@ function save() {
   if (!items.length) store.remove(KEY_ITEMS);
 }
 
-function sameDraft(previous, next) {
+// The newest record is replaced only by a continuation of the same draft (typing on or deleting at the end),
+// not by a different text that merely starts the same way.
+export function sameDraft(previous, next, now = Date.now()) {
   if (!previous || previous.target_lang !== next.target_lang) return false;
-  if (Date.now() - previous.ts > MERGE_WINDOW_MS) return false;
-  const head = (text) => text.slice(0, 24);
-  return next.source.startsWith(head(previous.source)) || previous.source.startsWith(head(next.source));
+  if (now - previous.ts > MERGE_WINDOW_MS) return false;
+  return next.source.startsWith(previous.source) || previous.source.startsWith(next.source);
 }
 
 export function recordTranslation(entry) {

@@ -26,11 +26,15 @@ const KEY_JOBS = "translator.jobs";
 const KEY_OPTS = "translator.docOptions";
 const KEY_FORMALITY = "translator.docFormality";
 const POLL_MS = 1500;
+const REVALIDATE_MS = 60000;
 const MAX_STORED_JOBS = 50;
+const MAX_LIST_IDS = 100;
+const UNAVAILABLE = "문서 번역을 사용할 수 없습니다";
 
 const ACTIVE = new Set(["queued", "extracting", "translating", "writing"]);
 const STATUS = {
   uploading: ["업로드 중", "accent"],
+  canceling: ["취소 중", "neutral"],
   queued: ["대기", "neutral"],
   extracting: ["분석 중", "accent"],
   translating: ["번역 중", "accent"],
@@ -68,6 +72,8 @@ const D = {
   cards: new Map(),
   staged: [],
   reports: new Map(),
+  rev: new Map(),
+  statusKey: "",
   output: "translated",
   pdfMode: "layout",
   glossaryId: "",
@@ -87,6 +93,11 @@ const normalizeExt = (value) => {
 const maxMb = () => Number(getStatus().limits?.doc_max_mb) || 50;
 const retentionHours = () => Number(getStatus().limits?.doc_retention_hours) || 24;
 const supportedExts = () => new Set(getStatus().document_formats.map((format) => normalizeExt(format.ext)));
+// The server sends an empty format list when the document feature is unavailable.
+const docsAvailable = () => getStatus().document_formats.length > 0;
+// Local changes to a job (cancel) make poll responses requested before them stale.
+const bumpRev = (id) => D.rev.set(id, (D.rev.get(id) || 0) + 1);
+const revOf = (id) => D.rev.get(id) || 0;
 // Formats that accept output "bilingual" (server flag `bilingual`; older servers: fixed list).
 function bilingualExts() {
   const formats = getStatus().document_formats;
@@ -167,6 +178,14 @@ function renderFormatChips() {
     labels.push(label);
   }
   el.chips.replaceChildren(...labels.map((label) => h("span", { class: "fmt-chip", text: label })));
+  const available = docsAvailable();
+  el.dropzone.classList.toggle("is-disabled", !available);
+  el.dropzone.setAttribute("aria-disabled", String(!available));
+  el.pick.disabled = !available;
+  el.pick.hidden = !available;
+  el.dzTitle.textContent = available ? "파일을 끌어다 놓으세요" : UNAVAILABLE;
+  el.dzMeta.hidden = !available;
+  el.chips.hidden = !available;
   const bilingualLabels = [...new Set([...bilingualExts()].map((ext) => ext.replace(".", "").toUpperCase()))];
   el.outputField.dataset.tip = bilingualLabels.length ? `원문+번역: ${bilingualLabels.join(" · ")}` : "";
   el.dzMeta.textContent = `최대 ${fmtNum(maxMb())}MB · ${fmtNum(retentionHours())}시간 후 자동 삭제`;
@@ -175,17 +194,22 @@ function renderFormatChips() {
 
 // ---------- staging ----------
 
+function fileError(file, ext) {
+  if (LEGACY[ext]) return `${LEGACY[ext].slice(1).toUpperCase()} 형식으로 저장한 뒤 올리세요`;
+  if (!supportedExts().has(ext)) return "지원하지 않는 형식";
+  if (file.size > maxMb() * 1024 * 1024) return `${fmtNum(maxMb())}MB 초과`;
+  if (file.size === 0) return "빈 파일";
+  return null;
+}
+
 export function addFiles(files) {
-  const supported = supportedExts();
-  const limit = maxMb() * 1024 * 1024;
+  if (!docsAvailable()) {
+    toast(UNAVAILABLE, { type: "error" });
+    return;
+  }
   for (const file of files) {
     const ext = extOf(file.name);
-    let error = null;
-    if (LEGACY[ext]) error = `${LEGACY[ext].slice(1).toUpperCase()} 형식으로 저장한 뒤 올리세요`;
-    else if (!supported.has(ext)) error = "지원하지 않는 형식";
-    else if (file.size > limit) error = `${fmtNum(maxMb())}MB 초과`;
-    else if (file.size === 0) error = "빈 파일";
-    D.staged.push({ id: uid(), file, ext, error });
+    D.staged.push({ id: uid(), file, ext, error: fileError(file, ext) });
   }
   renderStaging();
   requestAnimationFrame(() => {
@@ -203,13 +227,14 @@ function updateDropzone() {
 
 function renderStaging() {
   const staged = D.staged;
+  const focused = el.stagedList.contains(document.activeElement) ? document.activeElement.closest("li")?.dataset.id : null;
   el.staging.hidden = !staged.length;
   updateDropzone();
   el.stagedList.replaceChildren(
     ...staged.map((item) =>
       h(
         "li",
-        { class: `staged${item.error ? " is-invalid" : ""}` },
+        { class: `staged${item.error ? " is-invalid" : ""}`, "data-id": item.id },
         badge(item.ext),
         h(
           "div",
@@ -224,8 +249,11 @@ function renderStaging() {
             class: "icon-btn icon-btn-sm",
             "aria-label": `${item.file.name} 제거`,
             onclick: () => {
+              const index = D.staged.indexOf(item);
               D.staged = D.staged.filter((other) => other !== item);
               renderStaging();
+              const buttons = el.stagedList.querySelectorAll("button");
+              (buttons[Math.min(index, buttons.length - 1)] || el.pick).focus({ preventScroll: true });
             },
           },
           icon("x", { size: 16 }),
@@ -242,6 +270,7 @@ function renderStaging() {
   el.pdfField.hidden = !valid.some((item) => item.ext === ".pdf");
   el.start.disabled = !valid.length;
   el.startLabel.textContent = valid.length > 1 ? `번역 시작 · ${valid.length}개` : "번역 시작";
+  if (focused) el.stagedList.querySelector(`li[data-id="${focused}"] button`)?.focus({ preventScroll: true });
 }
 
 function startStaged() {
@@ -310,6 +339,10 @@ function createUpload(file, ext, options) {
         job.progress = { percent: (event.loaded / event.total) * 100 };
         renderJobs();
       });
+      // Once the whole body is sent the server may already be creating the job; cancel then waits for its id.
+      xhr.upload.addEventListener("load", () => {
+        job.sent = true;
+      });
       xhr.addEventListener("load", () => {
         job.xhr = null;
         if (xhr.status === 401) {
@@ -323,13 +356,18 @@ function createUpload(file, ext, options) {
         } catch {
           data = null;
         }
-        if (xhr.status >= 200 && xhr.status < 300 && data?.id) replaceTemp(tempId, data);
+        const created = xhr.status >= 200 && xhr.status < 300 && data?.id;
+        if (job.cancelRequested || !D.jobs.has(tempId)) {
+          if (created) discardJob(data.id);
+          removeJob(tempId);
+        } else if (created) replaceTemp(tempId, data);
         else failTemp(tempId, uploadError(xhr.status, typeof data?.detail === "string" ? data.detail : ""));
         resolve();
       });
       xhr.addEventListener("error", () => {
         job.xhr = null;
-        failTemp(tempId, "서버에 연결할 수 없습니다");
+        if (job.cancelRequested) removeJob(tempId);
+        else failTemp(tempId, "서버에 연결할 수 없습니다");
         resolve();
       });
       xhr.addEventListener("abort", () => {
@@ -355,6 +393,11 @@ function replaceTemp(tempId, job) {
   renderJobs();
   if (job.status === "done") loadReport(job.id);
   schedulePoll();
+}
+
+// Deletes a job the user canceled before its id was known (DELETE also stops a running job).
+function discardJob(id) {
+  api(`/api/documents/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
 }
 
 function failTemp(tempId, message) {
@@ -396,12 +439,14 @@ function schedulePoll(delay = POLL_MS) {
 async function poll() {
   const ids = activeIds();
   if (!ids.length) return;
+  const revs = new Map(ids.map((id) => [id, revOf(id)]));
   try {
     const data = await api(`/api/documents?ids=${ids.map(encodeURIComponent).join(",")}`);
     const seen = new Set();
     for (const job of Array.isArray(data?.jobs) ? data.jobs : []) {
       if (!D.jobs.has(job.id)) continue;
       seen.add(job.id);
+      if (revOf(job.id) !== revs.get(job.id)) continue;
       const previous = D.jobs.get(job.id);
       D.jobs.set(job.id, job);
       if (previous && previous.status !== "done" && job.status === "done") onJobDone(job);
@@ -410,7 +455,7 @@ async function poll() {
       }
     }
     for (const id of ids) {
-      if (!seen.has(id)) {
+      if (!seen.has(id) && revOf(id) === revs.get(id)) {
         D.jobs.delete(id);
         D.order = D.order.filter((other) => other !== id);
       }
@@ -421,6 +466,37 @@ async function poll() {
     /* transient failure: keep polling */
   }
   schedulePoll();
+}
+
+// Finished jobs are not polled; re-check them now and then so expired or deleted ones disappear.
+async function revalidateFinished() {
+  const ids = D.order.filter((id) => {
+    const job = D.jobs.get(id);
+    return job && !job.temp && !ACTIVE.has(job.status);
+  });
+  for (let index = 0; index < ids.length; index += MAX_LIST_IDS) {
+    const chunk = ids.slice(index, index + MAX_LIST_IDS);
+    let data;
+    try {
+      data = await api(`/api/documents?ids=${chunk.map(encodeURIComponent).join(",")}`);
+    } catch {
+      return;
+    }
+    const fresh = new Map((Array.isArray(data?.jobs) ? data.jobs : []).map((job) => [job.id, job]));
+    for (const id of chunk) {
+      if (!D.jobs.has(id)) continue;
+      if (fresh.has(id)) D.jobs.set(id, fresh.get(id));
+      else forgetJob(id);
+    }
+  }
+  persist();
+  renderJobs();
+}
+
+function forgetJob(id) {
+  D.jobs.delete(id);
+  D.order = D.order.filter((other) => other !== id);
+  D.reports.delete(id);
 }
 
 function onJobDone(job) {
@@ -470,14 +546,29 @@ async function cancelJob(id) {
   const job = D.jobs.get(id);
   if (!job) return;
   if (job.temp) {
+    if (job.xhr && job.sent) {
+      job.cancelRequested = true;
+      job.status = "canceling";
+      renderJobs();
+      return;
+    }
     job.xhr?.abort();
     if (!job.xhr) removeJob(id);
     return;
   }
+  bumpRev(id);
   try {
     const data = await api(`/api/documents/${encodeURIComponent(id)}/cancel`, { method: "POST" });
-    if (data && typeof data === "object" && data.id === id) D.jobs.set(id, data);
-    else job.status = "canceled";
+    bumpRev(id);
+    if (!D.jobs.has(id)) return;
+    if (data && typeof data === "object" && data.id === id) {
+      const previous = D.jobs.get(id);
+      D.jobs.set(id, data);
+      // The job may have finished just before the cancel arrived.
+      if (previous?.status !== "done" && data.status === "done") onJobDone(data);
+    } else {
+      job.status = "canceled";
+    }
   } catch (error) {
     if (error.status === 404) {
       removeJob(id);
@@ -514,8 +605,29 @@ async function deleteJob(id) {
   removeJob(id);
 }
 
-function downloadJob(job) {
-  downloadUrl(`/api/documents/${encodeURIComponent(job.id)}/download`);
+// Checks the job first: an expired or deleted job would otherwise give a silent failed download.
+async function downloadJob(id) {
+  let job;
+  try {
+    job = await api(`/api/documents/${encodeURIComponent(id)}`);
+  } catch (error) {
+    if (error.status === 404) {
+      forgetJob(id);
+      persist();
+      renderJobs();
+    }
+    toast(error.message, { type: "error", timeout: 4000 });
+    return;
+  }
+  if (D.jobs.has(id)) {
+    D.jobs.set(id, job);
+    renderJobs();
+  }
+  if (job?.status !== "done") {
+    toast("번역이 아직 끝나지 않았습니다", { type: "error" });
+    return;
+  }
+  downloadUrl(`/api/documents/${encodeURIComponent(id)}/download`);
 }
 
 // ---------- job cards ----------
@@ -540,9 +652,9 @@ function buildActions(job) {
     if (report?.length) {
       actions.push(actionButton({ label: `검수 ${fmtNum(report.length)}`, iconName: "clipboardCheck", onClick: () => openReport(job.id), compact: true }));
     }
-    actions.push(actionButton({ label: "내려받기", iconName: "download", onClick: () => downloadJob(D.jobs.get(job.id) || job), variant: "btn-primary" }));
+    actions.push(actionButton({ label: "내려받기", iconName: "download", onClick: () => downloadJob(job.id), variant: "btn-primary" }));
   }
-  if (job.status !== "uploading" && !ACTIVE.has(job.status)) {
+  if (job.status !== "uploading" && job.status !== "canceling" && !ACTIVE.has(job.status)) {
     actions.push(
       h(
         "button",
@@ -624,7 +736,7 @@ function updateCard(card, job) {
   refs.meta.textContent = parts.filter(Boolean).join(" · ");
 
   refs.bar.hidden = !running;
-  const indeterminate = job.status === "queued" || job.status === "extracting" || (job.status === "uploading" && percent === 0);
+  const indeterminate = job.status === "queued" || job.status === "extracting" || (job.status === "uploading" && (percent === 0 || job.sent));
   refs.bar.classList.toggle("is-indeterminate", indeterminate);
   refs.bar.firstChild.style.width = indeterminate ? "" : `${percent}%`;
   if (indeterminate) refs.bar.removeAttribute("aria-valuenow");
@@ -727,7 +839,7 @@ async function openPreview(id) {
   foot.append(
     h("span", { class: "spacer" }),
     copyButton,
-    h("button", { type: "button", class: "btn btn-primary", onclick: () => downloadJob(job) }, icon("download", { size: 16 }), "내려받기"),
+    h("button", { type: "button", class: "btn btn-primary", onclick: () => downloadJob(job.id) }, icon("download", { size: 16 }), "내려받기"),
   );
   try {
     const data = await api(`/api/documents/${encodeURIComponent(id)}/preview`);
@@ -782,6 +894,7 @@ export function initDocs() {
     pick: $("#pickBtn"),
     fileInput: $("#fileInput"),
     chips: $("#fmtChips"),
+    dzTitle: $("#dropzone .dz-title"),
     dzMeta: $("#dzMeta"),
     staging: $("#staging"),
     stagedList: $("#stagedList"),
@@ -845,7 +958,7 @@ export function initDocs() {
     el.fileInput.click();
   });
   el.dropzone.addEventListener("click", (event) => {
-    if (event.target.closest("button")) return;
+    if (event.target.closest("button") || !docsAvailable()) return;
     el.fileInput.click();
   });
   el.fileInput.addEventListener("change", () => {
@@ -859,12 +972,12 @@ export function initDocs() {
     if (!hasFiles(event)) return;
     event.preventDefault();
     depth += 1;
-    el.dropzone.classList.add("is-over");
+    if (docsAvailable()) el.dropzone.classList.add("is-over");
   });
   el.dropzone.addEventListener("dragover", (event) => {
     if (!hasFiles(event)) return;
     event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
+    event.dataTransfer.dropEffect = docsAvailable() ? "copy" : "none";
   });
   el.dropzone.addEventListener("dragleave", () => {
     depth = Math.max(0, depth - 1);
@@ -884,12 +997,14 @@ export function initDocs() {
   });
   el.start.addEventListener("click", startStaged);
 
-  onStatus(() => {
+  // Re-render only when formats or limits change (the 15 s status poll would otherwise steal focus).
+  onStatus((status) => {
+    const key = JSON.stringify([status.document_formats, status.limits?.doc_max_mb, status.limits?.doc_retention_hours]);
+    if (key === D.statusKey) return;
+    D.statusKey = key;
     renderFormatChips();
     if (D.staged.length) {
-      for (const item of D.staged) {
-        if (item.error === "지원하지 않는 형식" && supportedExts().has(item.ext)) item.error = null;
-      }
+      for (const item of D.staged) item.error = fileError(item.file, item.ext);
       renderStaging();
     }
   });
@@ -898,6 +1013,9 @@ export function initDocs() {
   renderJobs();
   restoreJobs();
   setInterval(() => {
-    if (D.order.some((id) => D.jobs.get(id)?.status === "done")) renderJobs();
-  }, 60000);
+    if (document.visibilityState === "visible") revalidateFinished();
+  }, REVALIDATE_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") revalidateFinished();
+  });
 }

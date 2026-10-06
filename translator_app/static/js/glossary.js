@@ -40,21 +40,37 @@ export function activeSummary() {
   return state.list.find((item) => item.id === state.activeId) || null;
 }
 
-export async function loadGlossaries() {
-  try {
-    const data = await api("/api/glossaries");
+let loading = null;
+let retryTimer = 0;
+let retryDelay = 2000;
+
+// A failed load keeps the saved choice (nothing is persisted) and is retried with backoff.
+export function loadGlossaries() {
+  if (loading) return loading;
+  clearTimeout(retryTimer);
+  loading = (async () => {
+    let data;
+    try {
+      data = await api("/api/glossaries");
+    } catch {
+      retryTimer = setTimeout(loadGlossaries, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 60000);
+      return;
+    } finally {
+      loading = null;
+    }
+    retryDelay = 2000;
     state.list = Array.isArray(data?.glossaries) ? data.glossaries : [];
     state.defaultId = data?.default_glossary_id || null;
-  } catch {
-    state.list = [];
-  }
-  const ids = new Set(state.list.map((item) => item.id));
-  if (!ids.has(state.activeId)) {
-    state.activeId = ids.has(state.defaultId) ? state.defaultId : state.list[0]?.id ?? null;
-  }
-  state.loaded = true;
-  persist();
-  emit("load");
+    const ids = new Set(state.list.map((item) => item.id));
+    if (!ids.has(state.activeId)) {
+      state.activeId = ids.has(state.defaultId) ? state.defaultId : state.list[0]?.id ?? null;
+    }
+    state.loaded = true;
+    persist();
+    emit("load");
+  })();
+  return loading;
 }
 
 export function setActiveGlossary(id) {
@@ -110,9 +126,13 @@ export async function addGlossaryEntry(entry) {
 }
 
 // Unsaved edits of the active glossary (sent with translation requests while the editor is dirty).
-export function draftEntries() {
+// With a text, only entries that can match it are sent (same rule as the server: case-insensitive substring).
+export function draftEntries(text) {
   if (!manager.dirty || manager.editingId !== state.activeId) return null;
-  return readRows();
+  const entries = readRows();
+  if (typeof text !== "string") return entries;
+  const lowered = text.toLowerCase();
+  return entries.filter((entry) => entry.enabled && lowered.includes(entry.source.toLowerCase()));
 }
 
 // ---------- Bindings for selects in the text/document tabs ----------
@@ -132,14 +152,37 @@ export function renderGlossaryOptions(select, { value, noneLabel = null } = {}) 
 
 // ---------- Manager dialog ----------
 
+// The editor keeps entries in `rows` (the source of truth) and renders only a page of the filtered view,
+// so glossaries with thousands of entries open instantly.
+const PAGE_ROWS = 100;
 const manager = {
   dialog: null,
   editingId: null,
   doc: null,
   dirty: false,
   langTemplate: null,
+  rows: [],
+  view: [],
+  limit: PAGE_ROWS,
+  invalid: new Set(),
   els: {},
 };
+
+const knownLang = (code) => (LANGUAGES.some((language) => language.code === code) ? code : LANGUAGES[0].code);
+
+function toRecord(entry = {}) {
+  const direction = directionProvider();
+  return {
+    enabled: entry.enabled ?? true,
+    source_lang: knownLang(entry.source_lang ?? direction.source),
+    target_lang: knownLang(entry.target_lang ?? direction.target),
+    source: entry.source ?? "",
+    target: entry.target ?? "",
+    note: entry.note ?? "",
+  };
+}
+
+const isPartial = (record) => Boolean(record.source.trim()) !== Boolean(record.target.trim());
 
 function langSelect(value, label) {
   if (!manager.langTemplate) {
@@ -153,16 +196,15 @@ function langSelect(value, label) {
   return select;
 }
 
-function makeRow(entry = {}) {
-  const direction = directionProvider();
+function makeRow(record) {
   const enabled = h("input", { type: "checkbox", "aria-label": "사용" });
-  enabled.checked = entry.enabled ?? true;
+  enabled.checked = record.enabled;
   const source = h("input", { type: "text", class: "cell-input", maxlength: "200", "aria-label": "원문 용어", placeholder: "원문 용어", "data-field": "source" });
-  source.value = entry.source ?? "";
+  source.value = record.source;
   const target = h("input", { type: "text", class: "cell-input", maxlength: "200", "aria-label": "번역 용어", placeholder: "번역 용어", "data-field": "target" });
-  target.value = entry.target ?? "";
+  target.value = record.target;
   const note = h("input", { type: "text", class: "cell-input", maxlength: "300", "aria-label": "메모", placeholder: "메모", "data-field": "note" });
-  note.value = entry.note ?? "";
+  note.value = record.note;
   const remove = h(
     "button",
     { type: "button", class: "icon-btn icon-btn-sm row-del", "aria-label": "행 삭제", "data-action": "remove" },
@@ -172,40 +214,111 @@ function makeRow(entry = {}) {
     "tr",
     {},
     h("td", { class: "c-use" }, enabled),
-    h("td", { class: "c-lang" }, langSelect(entry.source_lang ?? direction.source, "원문 언어")),
-    h("td", { class: "c-lang" }, langSelect(entry.target_lang ?? direction.target, "번역 언어")),
+    h("td", { class: "c-lang" }, langSelect(record.source_lang, "원문 언어")),
+    h("td", { class: "c-lang" }, langSelect(record.target_lang, "번역 언어")),
     h("td", {}, source),
     h("td", {}, target),
     h("td", {}, note),
     h("td", { class: "c-del" }, remove),
   );
   row._fields = { enabled, source, target, note, sourceLang: row.children[1].firstChild, targetLang: row.children[2].firstChild };
+  row._record = record;
+  markRow(row);
   return row;
 }
 
+function markRow(row) {
+  const record = row._record;
+  const invalid = manager.invalid.has(record);
+  row.classList.toggle("is-invalid", invalid);
+  row._fields.source.toggleAttribute("aria-invalid", invalid && !record.source.trim());
+  row._fields.target.toggleAttribute("aria-invalid", invalid && !record.target.trim());
+}
+
+// Copies a row's inputs into its record.
+function syncRecord(row) {
+  const { enabled, source, target, note, sourceLang, targetLang } = row._fields;
+  Object.assign(row._record, {
+    enabled: enabled.checked,
+    source_lang: sourceLang.value,
+    target_lang: targetLang.value,
+    source: source.value,
+    target: target.value,
+    note: note.value,
+  });
+}
+
+// Complete entries only; rows with both terms empty are ignored (half-filled rows are caught by validateRows).
 function readRows() {
-  const rows = [...manager.els.body.rows];
-  return rows
-    .map((row) => row._fields)
-    .filter(Boolean)
-    .map((fields) => ({
-      enabled: fields.enabled.checked,
-      source_lang: fields.sourceLang.value,
-      target_lang: fields.targetLang.value,
-      source: fields.source.value.trim(),
-      target: fields.target.value.trim(),
-      note: fields.note.value.trim(),
+  return manager.rows
+    .map((record) => ({
+      enabled: record.enabled,
+      source_lang: record.source_lang,
+      target_lang: record.target_lang,
+      source: record.source.trim(),
+      target: record.target.trim(),
+      note: record.note.trim(),
     }))
     .filter((entry) => entry.source && entry.target);
 }
 
 function renderRows(entries) {
-  const body = manager.els.body;
-  const fragment = document.createDocumentFragment();
-  for (const entry of entries) fragment.append(makeRow(entry));
-  body.replaceChildren(fragment);
-  applyFilter();
+  manager.rows = entries.map(toRecord);
+  manager.invalid = new Set();
+  manager.limit = PAGE_ROWS;
+  renderView();
   updateMeta();
+}
+
+function filteredRows() {
+  const query = manager.els.search.value.trim().toLowerCase();
+  if (!query) return manager.rows;
+  return manager.rows.filter((record) => `${record.source} ${record.target} ${record.note}`.toLowerCase().includes(query));
+}
+
+// Renders the first `limit` rows of the current view; with `append`, adds only the rows not yet shown.
+function renderView({ append = false } = {}) {
+  const { body, noMatch, search } = manager.els;
+  if (!append) manager.view = filteredRows();
+  const view = manager.view;
+  const shown = append ? body.rows.length : 0;
+  const fragment = document.createDocumentFragment();
+  for (const record of view.slice(shown, manager.limit)) fragment.append(makeRow(record));
+  if (append) body.append(fragment);
+  else body.replaceChildren(fragment);
+  updateMore();
+  noMatch.hidden = !search.value.trim() || view.length > 0;
+}
+
+function updateMore() {
+  const rest = manager.view.length - manager.els.body.rows.length;
+  manager.els.more.hidden = rest <= 0;
+  manager.els.more.textContent = rest > 0 ? `더 보기 (${fmtNum(rest)})` : "";
+}
+
+// Refuses to save half-filled rows: flags them, shows the first one and focuses its empty field.
+function validateRows() {
+  const partial = manager.rows.filter(isPartial);
+  manager.invalid = new Set(partial);
+  if (!partial.length) {
+    for (const row of manager.els.body.rows) if (row._record) markRow(row);
+    return true;
+  }
+  const first = partial[0];
+  if (!manager.view.includes(first)) {
+    manager.els.search.value = "";
+    manager.view = manager.rows;
+  }
+  const index = manager.view.indexOf(first);
+  if (index >= manager.limit) manager.limit = Math.ceil((index + 1) / PAGE_ROWS) * PAGE_ROWS;
+  renderView();
+  const row = [...manager.els.body.rows].find((item) => item._record === first);
+  if (row) {
+    row.scrollIntoView({ block: "nearest" });
+    (first.source.trim() ? row._fields.target : row._fields.source).focus();
+  }
+  toast(`원문 용어와 번역 용어를 모두 입력하세요 (${fmtNum(partial.length)}행)`, { type: "error", timeout: 4000 });
+  return false;
 }
 
 function setDirty(dirty) {
@@ -216,23 +329,14 @@ function setDirty(dirty) {
 }
 
 function updateMeta() {
-  const total = [...manager.els.body.rows].filter((row) => row._fields).length;
+  const total = manager.rows.length;
   manager.els.count.textContent = `${fmtNum(total)}개 항목`;
   manager.els.emptyRows.hidden = total > 0 || !manager.editingId;
 }
 
 function applyFilter() {
-  const query = manager.els.search.value.trim().toLowerCase();
-  let visible = 0;
-  for (const row of manager.els.body.rows) {
-    const fields = row._fields;
-    if (!fields) continue;
-    const haystack = `${fields.source.value} ${fields.target.value} ${fields.note.value}`.toLowerCase();
-    const show = !query || haystack.includes(query);
-    row.hidden = !show;
-    if (show) visible += 1;
-  }
-  manager.els.noMatch.hidden = !query || visible > 0;
+  manager.limit = PAGE_ROWS;
+  renderView();
 }
 
 function renderPicker() {
@@ -256,6 +360,10 @@ function renderPicker() {
 async function openEditing(id) {
   manager.editingId = id || null;
   manager.doc = null;
+  manager.rows = [];
+  manager.view = [];
+  manager.invalid = new Set();
+  manager.els.more.hidden = true;
   renderPicker();
   setDirty(false);
   manager.els.search.value = "";
@@ -300,6 +408,7 @@ async function resolveUnsaved() {
 
 async function save() {
   if (!manager.editingId || !manager.doc) return false;
+  if (!validateRows()) return false;
   const button = manager.els.save;
   button.disabled = true;
   try {
@@ -406,6 +515,7 @@ function renameGlossary(anchor) {
       value: manager.doc.name,
       submitLabel: "변경",
       onSubmit: async (name) => {
+        if (manager.dirty && !validateRows()) return;
         const entries = manager.dirty ? readRows() : manager.doc.entries;
         const data = await api(`/api/glossaries/${encodeURIComponent(manager.doc.id)}`, {
           method: "PUT",
@@ -439,7 +549,14 @@ async function deleteGlossary() {
       return;
     }
   }
-  state.docs.delete(manager.doc.id);
+  const deletedId = manager.doc.id;
+  state.docs.delete(deletedId);
+  state.list = state.list.filter((item) => item.id !== deletedId);
+  if (state.activeId === deletedId) {
+    state.activeId = state.list[0]?.id ?? null;
+    persist();
+    emit("active");
+  }
   setDirty(false);
   await loadGlossaries();
   await openEditing(state.activeId);
@@ -450,7 +567,11 @@ function importPopover(anchor) {
   if (!manager.doc) return;
   if (isPopoverFor(anchor)) return closePopover();
   const direction = directionProvider();
-  const fileInput = h("input", { type: "file", accept: ".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain", hidden: true });
+  const fileInput = h("input", {
+    type: "file",
+    accept: ".csv,.tsv,.txt,.xlsx,text/csv,text/tab-separated-values,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    hidden: true,
+  });
   const fileName = h("span", { class: "file-name muted", text: "선택된 파일 없음" });
   const pick = h("button", { type: "button", class: "btn btn-sm", onclick: () => fileInput.click() }, icon("file", { size: 16 }), "파일 선택");
   let mode = "append";
@@ -517,7 +638,7 @@ function importPopover(anchor) {
   const content = h(
     "div",
     { class: "pop-form import-form" },
-    h("div", { class: "pop-head" }, h("span", { class: "pop-title", text: "가져오기" }), h("span", { class: "pop-sub", text: "CSV · TSV" })),
+    h("div", { class: "pop-head" }, h("span", { class: "pop-title", text: "가져오기" }), h("span", { class: "pop-sub", text: "CSV · TSV · XLSX" })),
     h("div", { class: "form-row" }, h("span", { class: "form-label", text: "파일" }), h("div", { class: "form-control file-pick" }, pick, fileName, fileInput)),
     h("div", { class: "form-row" }, h("span", { class: "form-label", text: "방식" }), h("div", { class: "seg seg-sm", role: "radiogroup", "aria-label": "가져오기 방식" }, modeButtons)),
     h(
@@ -564,6 +685,7 @@ function buildManager() {
   els.body = h("tbody");
   els.noMatch = h("div", { class: "table-empty", hidden: true, text: "검색 결과 없음" });
   els.emptyRows = h("div", { class: "table-empty", hidden: true, text: "항목 없음" });
+  els.more = h("button", { type: "button", class: "btn btn-ghost btn-sm gl-more", hidden: true });
   els.tableWrap = h(
     "div",
     { class: "table-wrap" },
@@ -587,6 +709,7 @@ function buildManager() {
       ),
       els.body,
     ),
+    els.more,
     els.noMatch,
     els.emptyRows,
   );
@@ -646,25 +769,46 @@ function buildManager() {
   els.exportBtn.addEventListener("click", () => exportPopover(els.exportBtn));
   els.save.addEventListener("click", save);
   els.search.addEventListener("input", applyFilter);
+  els.more.addEventListener("click", () => {
+    manager.limit = manager.els.body.rows.length + PAGE_ROWS * 2;
+    renderView({ append: true });
+  });
+  // New rows go on top so they are always on the first page.
   els.addRow.addEventListener("click", () => {
+    manager.rows.unshift(toRecord());
     els.search.value = "";
     applyFilter();
-    const row = makeRow();
-    els.body.append(row);
     updateMeta();
-    row._fields.source.focus();
-    row.scrollIntoView({ block: "nearest" });
+    const row = els.body.rows[0];
+    row?._fields.source.focus();
+    row?.scrollIntoView({ block: "nearest" });
   });
-  els.body.addEventListener("input", () => setDirty(true));
-  els.body.addEventListener("change", () => setDirty(true));
+  const onCellEdit = (event) => {
+    const row = event.target.closest("tr");
+    if (!row?._record) return;
+    syncRecord(row);
+    if (manager.invalid.has(row._record) && !isPartial(row._record)) manager.invalid.delete(row._record);
+    markRow(row);
+    setDirty(true);
+  };
+  els.body.addEventListener("input", onCellEdit);
+  els.body.addEventListener("change", onCellEdit);
   els.body.addEventListener("click", (event) => {
     const button = event.target.closest('[data-action="remove"]');
     if (!button) return;
     const row = button.closest("tr");
-    const next = row.nextElementSibling || row.previousElementSibling;
+    const record = row._record;
+    const index = [...els.body.rows].indexOf(row);
+    manager.rows = manager.rows.filter((item) => item !== record);
+    manager.view = manager.view.filter((item) => item !== record);
+    manager.invalid.delete(record);
     row.remove();
+    // Keep the page full: show the row of the view that was just below the page.
+    if (els.body.rows.length < Math.min(manager.limit, manager.view.length)) renderView({ append: true });
+    else updateMore();
     setDirty(true);
     updateMeta();
+    const next = els.body.rows[Math.min(index, els.body.rows.length - 1)];
     next?.querySelector(".row-del")?.focus();
   });
   dialog.addEventListener("keydown", (event) => {
