@@ -3,7 +3,9 @@
 Cookie ``translator_session`` = ``<user b64>|<issued_at>|<session id>|<HMAC-SHA256 hex>``, HttpOnly,
 SameSite=Lax, valid for 12 hours. No Secure flag: the app is served over plain HTTP inside the LAN.
 The HMAC key is SESSION_SECRET bound to a fingerprint of UI_USER/UI_PASSWORD, so changing the password
-invalidates every cookie; logout revokes the cookie's session id on the server.
+invalidates every cookie; logout revokes the cookie's session id on the server. Each app start also mixes a
+fresh random value into the key, so cookies issued before the start (including logged-out ones, whose
+revocation lived only in memory) stop working and everyone logs in again after a restart.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import hmac
 import json
 import secrets
 import time
+from collections.abc import Callable
 from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -61,7 +64,8 @@ def session_signing_key(settings: Settings) -> bytes:
 
 class SessionSigner:
     def __init__(self, key: bytes, *, ttl: int = SESSION_TTL_SECONDS) -> None:
-        self._key = key
+        # per-start salt: tokens from an earlier process never verify (logout survives restarts)
+        self._key = hmac.new(key, b"boot\0" + secrets.token_bytes(16), hashlib.sha256).digest()
         self.ttl = ttl
         self._revoked: dict[str, float] = {}  # session id -> time after which the token expires anyway
 
@@ -121,20 +125,24 @@ def check_credentials(settings: Settings, username: str, password: str) -> bool:
 
 
 class LoginThrottle:
-    """Global brake for wrong passwords. Every failed login waits ``delay`` seconds while holding one
-    lock, so wrong guesses are answered one at a time (about one per second for all clients together).
-    A correct login never waits. There is no per-client lockout: every browser reaches the app through
+    """Global brake for password guesses. Every login attempt checks the password while holding one
+    lock, and a wrong one keeps holding it for ``delay`` seconds, so all clients together get about one
+    guess per second. A correct password is answered at once but waits behind wrong guesses already
+    queued (accepted trade-off). There is no per-client lockout: every browser reaches the app through
     the gate's address, so a lockout would lock everyone out."""
 
     def __init__(self, delay: float = LOGIN_FAILURE_DELAY) -> None:
         self.delay = delay
         self._lock: asyncio.Lock | None = None
 
-    async def failed(self) -> None:
+    async def attempt(self, check: Callable[[], bool]) -> bool:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
+            if check():
+                return True
             await asyncio.sleep(self.delay)
+            return False
 
 
 def session_token_from_scope(scope: Scope) -> str | None:

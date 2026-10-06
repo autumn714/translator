@@ -224,7 +224,7 @@ window.__job = (id, status, extra = {}) => ({
 
 
 def scenarios(ids: dict[str, str]) -> list[dict[str, Any]]:
-    big, rows, add, saved = (json.dumps(ids[key]) for key in ("big", "rows", "add", "saved"))
+    big, rows, add, saved, draft = (json.dumps(ids[key]) for key in ("big", "rows", "add", "saved", "draft"))
     return [
         {
             "name": "status_chip",
@@ -631,7 +631,7 @@ __t.mocks.push((url) => {
             "name": "history_keeps_different_texts",
             "init": "localStorage.setItem('translator.historyEnabled', 'true'); localStorage.setItem('translator.targetLang', JSON.stringify('en'));",
             "run": r"""async () => {
-  const a = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 첫 번째 문서입니다.";
+  const a = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 첫 번째 문서는 회의 자료입니다.";
   const b = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 두 번째 자료를 보내드립니다.";
   const items = () => JSON.parse(localStorage.getItem("translator.history") || "[]").map((item) => item.source);
   __t.typeSource(a);
@@ -648,6 +648,44 @@ __t.mocks.push((url) => {
   await __t.translated("again.");
   await __t.until(() => items().includes("Hello world, again."));
   return { first, second: items() };
+}""",
+        },
+        {
+            "name": "history_merges_mid_edits",
+            "init": "localStorage.setItem('translator.historyEnabled', 'true'); localStorage.setItem('translator.targetLang', JSON.stringify('en'));",
+            "run": r"""async () => {
+  const { sameDraft } = await import("/static/js/history.js");
+  const items = () => JSON.parse(localStorage.getItem("translator.history") || "[]").map((item) => item.source);
+  const a = "The quick brown fox jumps over the lazy dog near the river bank.";
+  const b = "The quick brown cat jumps over the lazy dog near the river bank.";
+  __t.typeSource(a);
+  await __t.translated("fox");
+  await __t.until(() => items().includes(a));
+  __t.typeSource(b);
+  await __t.translated("cat");
+  await __t.until(() => items().includes(b));
+  const now = Date.now();
+  const rec = (source, ts = now) => ({ source, target_lang: "en", ts });
+  return {
+    items: items(),
+    unrelated: sameDraft(rec("Annual report on hydrogen"), rec("Annual budget for solar panels"), now),
+    stale: sameDraft(rec(a, now - 6 * 60 * 1000), rec(b), now),
+    otherLang: sameDraft(rec(a), { source: b, target_lang: "ja" }, now),
+  };
+}""",
+        },
+        {
+            "name": "glossary_draft_whitespace",
+            "init": f"localStorage.setItem('translator.glossaryId', JSON.stringify({draft})); localStorage.setItem('translator.useGlossary', 'true');",
+            "run": r"""async () => {
+  document.querySelector("#glossaryBtn").click();
+  const dialog = await __t.until(() => document.querySelector("dialog.gl-dialog[open]"));
+  const source = await __t.until(() => dialog.querySelector("tbody tr [data-field='source']"));
+  source.value = "Fuel   Cell";
+  source.dispatchEvent(new Event("input", { bubbles: true }));
+  __t.typeSource("A hydrogen fuel\n\n cell stack.");
+  const call = await __t.until(() => __t.calls.find((c) => c.url.includes("/api/translate/stream")));
+  return (JSON.parse(call.body).glossary_entries || []).map((entry) => entry.source);
 }""",
         },
         {
@@ -803,6 +841,7 @@ def ui(tmp_path_factory: pytest.TempPathFactory):
             "rows": create("행 시험", [{"source_lang": "en", "target_lang": "ko", "source": "alpha", "target": "알파"}]),
             "add": create("추가 시험", [{"source_lang": "en", "target_lang": "ko", "source": "zeta", "target": "제타"}]),
             "saved": create("저장된 선택", [{"source_lang": "en", "target_lang": "ko", "source": "beta", "target": "베타"}]),
+            "draft": create("편집 중", [{"source_lang": "en", "target_lang": "ko", "source": "fuel cell", "target": "연료전지"}]),
             "big": create("대용량", [
                 {"source_lang": "en", "target_lang": "ko", "source": f"term{index}", "target": f"용어{index}"}
                 for index in range(20000)
@@ -938,10 +977,20 @@ def test_finished_jobs_are_revalidated(ui) -> None:
 
 def test_history_keeps_texts_with_same_opening(ui) -> None:
     result = value(ui, "history_keeps_different_texts")
-    a = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 첫 번째 문서입니다."
+    a = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 첫 번째 문서는 회의 자료입니다."
     b = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 두 번째 자료를 보내드립니다."
     assert result["first"] == [b, a]
     assert result["second"] == ["Hello world, again.", b, a]  # typing on merges into one record
+
+
+def test_history_merges_edits_in_the_middle(ui) -> None:
+    result = value(ui, "history_merges_mid_edits")
+    assert result["items"] == ["The quick brown cat jumps over the lazy dog near the river bank."]
+    assert result["unrelated"] is False and result["stale"] is False and result["otherLang"] is False
+
+
+def test_unsaved_glossary_terms_match_across_whitespace(ui) -> None:
+    assert value(ui, "glossary_draft_whitespace") == ["Fuel   Cell"]
 
 
 def test_glossary_add_while_disabled_keeps_edits(ui) -> None:

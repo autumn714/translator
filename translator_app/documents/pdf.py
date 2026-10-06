@@ -15,7 +15,9 @@ layout mode
      original box) on ONE separate overlay document and stamped onto the pages, so
      the font is embedded once per document instead of once per text box
   4. scanned / garbled / OCR-layer pages: the page is rendered (~2 MP) and read by
-     the vision model; a page with the translated text is inserted after it
+     the vision model; a page with the translated text is inserted after it.  Without
+     vision, an OCR layer is translated onto that page and a scan's own visible text
+     (title, stamp) is translated in place
 docx mode
   the same text (and vision-model pages) written as a Word document.
 
@@ -59,10 +61,13 @@ SCAN_UNIT_CHARS = 1500                 # progress weight of one vision-model pag
 MAX_STORY_PAGES = 40                   # safety cap for one inserted translation
 
 # a page whose images cover more than half of it and whose visible text is no more than
-# a stamp / page number / header is a scan: its content is in the image
+# a stamp / page number / header is a scan: its content is in the image.  Real text over a
+# full-page picture (a slide title and subtitle) keeps the page digital.
 SCAN_IMAGE_SHARE = 0.5
 SCAN_MAX_VISIBLE_CHARS = 200
 SCAN_MAX_TEXT_SHARE = 0.05
+SCAN_MAX_LETTERS = 20                  # fewer letters than this is a page number / stamp ...
+SCAN_SHORT_TOKEN = 3                   # ... and so are only digits / tokens this short
 
 # text extraction without image data (images are only measured, never needed here)
 TEXT_FLAGS = pymupdf.TEXTFLAGS_RAWDICT & ~pymupdf.TEXT_PRESERVE_IMAGES
@@ -133,6 +138,12 @@ def _nonspace(s: str) -> int:
     return sum(1 for c in s if not c.isspace())
 
 
+def _negligible(texts: list[str]) -> bool:
+    """Page numbers, stamps, codes: nothing worth translating in place of the scan."""
+    letters = [sum(1 for c in token if c.isalpha()) for token in " ".join(texts).split()]
+    return sum(letters) < SCAN_MAX_LETTERS or max(letters, default=0) <= SCAN_SHORT_TOKEN
+
+
 def _image_share(page) -> float:
     area = abs(page.rect) or 1.0
     try:
@@ -167,10 +178,13 @@ def classify_page(page, blocks: list[dict] | None = None) -> str:
     if (vis_chars < SCAN_MAX_VISIBLE_CHARS and vis_area < SCAN_MAX_TEXT_SHARE * area
             and _image_share(page) > SCAN_IMAGE_SHARE):
         # a scan with a digital stamp / page number on top: the body is in the image
-        return "ocr_layer" if hidden_chars else "scanned"
+        if hidden_chars > vis_chars:
+            return "ocr_layer"
+        if _negligible(visible):
+            return "ocr_layer" if hidden_chars else "scanned"
     # fonts without a usable ToUnicode map extract as U+FFFD / private-use garbage
     text = "".join(visible)
-    bad = sum(1 for c in text if c == "�" or 0xE000 <= ord(c) <= 0xF8FF)
+    bad = sum(1 for c in text if c == "\ufffd" or 0xE000 <= ord(c) <= 0xF8FF)
     if bad > 0.2 * _nonspace(text):
         return "garbled"
     return "digital"
@@ -259,10 +273,11 @@ def analyze(path: str | Path) -> list[PageInfo]:
             blocks = text_blocks(page)
             kind = classify_page(page, blocks)
             texts: list[str] = []
-            if kind in ("digital", "ocr_layer"):
+            if kind in ("digital", "ocr_layer", "scanned"):
                 if page.rotation:
                     page.remove_rotation()              # same coordinates as in write_layout()
                     blocks = text_blocks(page)
+                # scanned: its visible text (translated in place when there is no vision)
                 texts = [u.text for u in page_units(page, invisible=kind == "ocr_layer", blocks=blocks)]
             pages.append(PageInfo(kind, texts))
         return pages
@@ -676,6 +691,7 @@ class PdfHandler:
         added: dict[int, str] = {}
         vision_off = False
         deferred: list[int] = []
+        in_place: list[int] = []
         for pno in vlm_pages:
             ctx.check_cancel()
             ctx.set_status("translating")
@@ -689,9 +705,20 @@ class PdfHandler:
                     vision_off = True
             if pages[pno].kind == "ocr_layer" and pages[pno].texts:
                 deferred.append(pno)                   # translated from its text layer below
+            elif pages[pno].kind == "scanned" and any(has_letters(t) for t in pages[pno].texts):
+                in_place.append(pno)                   # its visible text is translated in place below
             else:
                 ctx.unit_done(1, weights[pno])
 
+        if in_place:
+            # a scan without vision: at least its visible text (title, stamp) is translated in place
+            ctx.add_units(-len(in_place), -sum(weights[i] for i in in_place))
+            more = [t for t in dict.fromkeys(t for i in in_place for t in pages[i].texts) if t not in table]
+            if more:
+                table.update(await ctx.translate_strings(more))
+                texts += more
+            for i in in_place:
+                pages[i] = PageInfo("digital", pages[i].texts)
         if deferred:
             # OCR-layer pages can still be translated from their (invisible) text layer.
             # The work reserved for the vision model is released first; it covers the text.
@@ -702,9 +729,12 @@ class PdfHandler:
             for i in deferred:
                 added[i] = "\n\n".join(ocr_table.get(t, t) for t in pages[i].texts)
         if vision_off:
-            missing = [i + 1 for i in vlm_pages if i not in added]
+            missing = [i + 1 for i in vlm_pages if i not in added and i not in in_place]
             if missing:
                 ctx.warn(f"{MSG_VISION_UNAVAILABLE} 스캔 페이지({_page_list(missing)})는 번역하지 않았습니다.")
+            if in_place:
+                pages_text = _page_list([i + 1 for i in in_place])
+                ctx.warn(f"{MSG_VISION_UNAVAILABLE} 스캔 페이지({pages_text})는 이미지 속 글자를 빼고 번역했습니다.")
 
         if ctx.pdf_mode == "layout" and any(t.strip() for t in added.values()):
             ctx.warn(f"스캔 페이지({_page_list([i + 1 for i in sorted(added)])}) 뒤에 번역 페이지를 넣었습니다.")

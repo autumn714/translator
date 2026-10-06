@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
@@ -223,7 +224,7 @@ def match_glossary_entries(
 
 
 # Scripts written without spaces between words (or with particles glued to words, like Korean):
-# a term there is a plain substring. Other scripts match whole words only ("AI" is not in "maintain").
+# a term there is a plain substring. Latin/digit term edges match whole words only ("AI" is not in "maintain").
 _SPACELESS_SCRIPT = re.compile(
     "[\u0e00-\u0e7f\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff"
     "\uac00-\ud7af\uf900-\ufaff\uff66-\uff9d]"
@@ -248,7 +249,13 @@ def _term_rule(term: str) -> tuple[str, str]:
 
 
 def _is_word_char(char: str) -> bool:
-    return char.isalnum() or char == "_"
+    """Latin letters (accented too), digits and "_". Hangul, Kana, Han and other scripts are boundaries,
+    so "ESS" is found in "ESS를", "LNG" in "LNG船" and "AI" in "生成AIの"."""
+    if char.isascii():
+        return char.isalnum() or char == "_"
+    if char.isdecimal():
+        return True
+    return char.isalpha() and unicodedata.name(char, "").startswith("LATIN ")
 
 
 def _find_word(haystack: str, needle: str, suffixes: tuple[str, ...]) -> bool:
@@ -355,6 +362,19 @@ class GlossaryImportError(ValueError):
     """Import failed; the message is shown to the user (Korean)."""
 
 
+# a CSV/TSV cell a spreadsheet would run as a formula gets one leading "'" on export, removed again on
+# import (cells that already start with "'"s before such a character get one more, so round trips are exact)
+_FORMULA_CELL = re.compile(r"'*[=+\-@\t\r]")
+
+
+def _escape_cell(value: str) -> str:
+    return "'" + value if _FORMULA_CELL.match(value) else value
+
+
+def _unescape_cell(value: str) -> str:
+    return value[1:] if value.startswith("'") and _FORMULA_CELL.match(value) else value
+
+
 def export_entries(entries: list[GlossaryEntry], fmt: str = "csv") -> bytes:
     """UTF-8 with BOM (so Excel detects the encoding); columns EXPORT_COLUMNS."""
     buffer = io.StringIO()
@@ -363,15 +383,18 @@ def export_entries(entries: list[GlossaryEntry], fmt: str = "csv") -> bytes:
     for entry in entries:
         writer.writerow(
             [
-                entry.source_lang,
-                entry.target_lang,
-                entry.source,
-                entry.target,
-                entry.note,
-                "true" if entry.enabled else "false",
+                _escape_cell(cell)
+                for cell in (
+                    entry.source_lang,
+                    entry.target_lang,
+                    entry.source,
+                    entry.target,
+                    entry.note,
+                    "true" if entry.enabled else "false",
+                )
             ]
         )
-    return "﻿".encode() + buffer.getvalue().encode("utf-8")
+    return "\ufeff".encode() + buffer.getvalue().encode("utf-8")
 
 
 def parse_import(
@@ -393,7 +416,7 @@ def parse_import(
         rows = _xlsx_rows(data)
     else:
         rows = _text_rows(_decode(data), ext)
-    rows = [[cell.strip() for cell in row] for row in rows]
+    rows = [[_unescape_cell(cell.strip()) for cell in row] for row in rows]
     rows = [row for row in rows if any(row)]
     if not rows:
         raise GlossaryImportError("가져올 항목이 없습니다.")
@@ -492,7 +515,7 @@ def _text_rows(text: str, ext: str) -> list[list[str]]:
 def _header_columns(row: list[str]) -> dict[str, int] | None:
     columns: dict[str, int] = {}
     for index, cell in enumerate(row):
-        name = _HEADER_ALIASES.get(cell.replace("﻿", "").strip().lower())
+        name = _HEADER_ALIASES.get(cell.replace("\ufeff", "").strip().lower())
         if name and name not in columns:
             columns[name] = index
     if "source" in columns and "target" in columns:
@@ -526,7 +549,7 @@ def _parse_enabled(value: str) -> bool:
 
 _XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _XLSX_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-_XLSX_MAX_XML = 50 * 1024 * 1024
+_XLSX_MAX_XML = 10 * 1024 * 1024        # one unpacked part (a 5 MB upload can hold far more)
 
 
 def _xlsx_rows(data: bytes) -> list[list[str]]:

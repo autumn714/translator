@@ -149,3 +149,22 @@ def test_content_disposition():
     assert unquote(cd.split("filename*=UTF-8''", 1)[1]) == "보고서 v2.docx"
     cd = content_disposition('evil"\r\nX-Injected: 1.txt')
     assert "\r" not in cd and "\n" not in cd and cd.count('"') == 2
+
+
+def test_image_upload_is_refused_without_vision(tmp_path):
+    from types import SimpleNamespace
+
+    app = make_app(tmp_path)
+    with TestClient(app) as client:
+        manager = app.state.job_manager
+        png = F.make_png("IMAGE TEXT", (300, 150))
+        app.state.llm = SimpleNamespace(vision_enabled=False)
+        for name in ("scan.png", "PHOTO.JPG", "a.jpeg", "b.webp"):
+            r = upload(client, name, png + b"\0" * 300_000, {"source_lang": "en", "target_lang": "ko"})
+            assert r.status_code == 415, (name, r.text)
+            assert r.json()["detail"] == "이미지 인식을 지원하지 않는 모델입니다. 이미지 파일은 번역할 수 없습니다."
+        assert not manager.jobs and not any(manager.incoming.iterdir())       # nothing kept on disk
+        assert upload(client, "a.txt", b"Hello world.", {"source_lang": "en"}).status_code == 202
+        app.state.llm = SimpleNamespace(vision_enabled=True)
+        r = upload(client, "scan.png", png, {"source_lang": "en", "target_lang": "ko"})
+        assert r.status_code == 202, r.text

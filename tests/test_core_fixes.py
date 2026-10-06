@@ -323,9 +323,23 @@ def _status_with(app, token: str) -> int:  # noqa: ANN001
 
 
 def test_password_change_invalidates_existing_cookies(tmp_path) -> None:
-    token = _login_token(_auth_app(tmp_path))
-    assert _status_with(_auth_app(tmp_path), token) == 200  # restart, same password: still logged in
+    app = _auth_app(tmp_path)
+    token = _login_token(app)
+    assert _status_with(app, token) == 200
     assert _status_with(_auth_app(tmp_path, password="new-pass"), token) == 401
+
+
+def test_restart_invalidates_cookies_so_logout_survives_it(tmp_path) -> None:
+    app = _auth_app(tmp_path)
+    with TestClient(app, follow_redirects=False) as client:
+        token = client.post("/api/login", json={"username": "keei", "password": "old-pass"}).cookies[COOKIE_NAME]
+        assert client.post("/api/logout").status_code == 200
+    token = token.strip('"')
+    assert _status_with(app, token) == 401  # logged out
+    restarted = _auth_app(tmp_path)  # same password, revocation list lost: the copied cookie still fails
+    assert _status_with(restarted, token) == 401
+    assert _status_with(restarted, _login_token(_auth_app(tmp_path))) == 401  # any pre-restart cookie
+    assert _status_with(restarted, _login_token(restarted)) == 200
 
 
 def test_logout_revokes_the_session_on_the_server(tmp_path) -> None:

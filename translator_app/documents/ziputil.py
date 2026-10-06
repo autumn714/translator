@@ -158,7 +158,8 @@ def rewrite_zip(
                 if selected:
                     tree = parse_xml(data)
                     transform(info.filename, tree)
-                    data = dump_xml(tree)
+                    if zout is not None:                # pass 1 only collects: nothing to serialise
+                        data = dump_xml(tree)
                     changed.append(info.filename)
                 if zout is not None:
                     zout.writestr(_copy_info(info), data)

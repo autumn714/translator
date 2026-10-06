@@ -126,13 +126,16 @@ export async function addGlossaryEntry(entry) {
 }
 
 // Unsaved edits of the active glossary (sent with translation requests while the editor is dirty).
-// With a text, only entries that can match it are sent (same rule as the server: case-insensitive substring).
+// With a text, only entries that can match it are sent (a superset of the server's rule: case-insensitive
+// substring with whitespace runs collapsed on both sides).
+const squash = (value) => value.replace(/\s+/g, " ").toLowerCase();
+
 export function draftEntries(text) {
   if (!manager.dirty || manager.editingId !== state.activeId) return null;
   const entries = readRows();
   if (typeof text !== "string") return entries;
-  const lowered = text.toLowerCase();
-  return entries.filter((entry) => entry.enabled && lowered.includes(entry.source.toLowerCase()));
+  const haystack = squash(text);
+  return entries.filter((entry) => entry.enabled && haystack.includes(squash(entry.source)));
 }
 
 // ---------- Bindings for selects in the text/document tabs ----------

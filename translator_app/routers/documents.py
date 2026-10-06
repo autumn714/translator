@@ -23,7 +23,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
-from translator_app.documents.base import DocumentError
+from translator_app.documents import IMAGE_EXTS
+from translator_app.documents.base import MSG_VISION_UNAVAILABLE, DocumentError
 from translator_app.documents.jobs import MSG_DISK_FULL, Job, JobManager, sanitize_filename
 from translator_app.documents.schemas import (
     DocumentJob,
@@ -32,6 +33,7 @@ from translator_app.documents.schemas import (
     PreviewResponse,
     ReportResponse,
 )
+from translator_app.routers.system import vision_available
 
 logger = logging.getLogger("translator.documents")
 
@@ -50,6 +52,7 @@ MSG_NO_FILE = "파일을 첨부해 주세요."
 MSG_BAD_FORM = "업로드 형식이 올바르지 않습니다."
 MSG_BAD_OPTIONS = "번역 옵션이 올바르지 않습니다."
 MSG_OUTPUT_GONE = "번역된 파일을 찾을 수 없습니다."
+MSG_IMAGE_NO_VISION = f"{MSG_VISION_UNAVAILABLE} 이미지 파일은 번역할 수 없습니다."
 
 _MEDIA_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -118,8 +121,14 @@ class _BadUpload(Exception):
     pass
 
 
-async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, str, dict[str, str], int]:
+class _RejectedType(Exception):
+    pass
+
+
+async def _receive_upload(request: Request, manager: JobManager,
+                          rejected: frozenset[str] = frozenset()) -> tuple[Path, str, dict[str, str], int]:
     """Stream the multipart body: the part named "file" goes to disk, small fields to memory.
+    A file whose extension is in ``rejected`` stops the upload as soon as its name arrives.
     -> (temp path, client filename, fields, file size)."""
     from python_multipart.exceptions import FormParserError
     from python_multipart.multipart import MultipartParser, parse_options_header
@@ -168,6 +177,8 @@ async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, 
         if b"filename" in opts and state["name"] == "file" and not state["done_file"]:
             state["is_file"] = True
             file_info["filename"] = _decode_header_value(opts[b"filename"])
+            if Path(sanitize_filename(file_info["filename"])).suffix.lower() in rejected:
+                raise _RejectedType()
 
     def on_part_data(data: bytes, start: int, end: int) -> None:
         chunk = data[start:end]
@@ -237,8 +248,12 @@ async def upload_document(request: Request) -> Any:
     if declared and declared.isdigit() and int(declared) > manager.max_bytes + 1024 * 1024:
         return JSONResponse(status_code=413, content={"detail": _limit_message(max_mb)},
                             headers={"Connection": "close"})
+    # without vision the model cannot read images (same rule as document_formats in /api/status)
+    rejected = frozenset() if vision_available(request) else IMAGE_EXTS
     try:
-        tmp, filename, fields, _size = await _receive_upload(request, manager)
+        tmp, filename, fields, _size = await _receive_upload(request, manager, rejected)
+    except _RejectedType:
+        return JSONResponse(status_code=415, content={"detail": MSG_IMAGE_NO_VISION}, headers={"Connection": "close"})
     except _UploadTooLarge:
         return JSONResponse(status_code=413, content={"detail": _limit_message(max_mb)},
                             headers={"Connection": "close"})

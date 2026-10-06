@@ -257,3 +257,21 @@ def test_chunking_and_lanes():
     lanes = _lanes(chunks, 2)
     assert len(lanes) == 2 and [t for lane in lanes for c in lane for t in c] == texts
     assert _lanes(chunks[:1], 4) == [chunks[:1]]
+
+
+@pytest.mark.anyio
+async def test_preceding_context_is_plain_text_even_when_tags_were_dropped(tmp_path):
+    tr = F.FakeTranslator(mode="drop_tags")                        # keeps the encoder's "&amp;", drops the tags
+    m = JobManager(settings=F.settings(tmp_path, llm_doc_parallel=1), translator=tr)
+    await m.start()
+    try:
+        paragraphs = "".join(f"<p><b>R&amp;D</b> budget number {i} grew.</p>" for i in range(40))
+        html = f"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"></head><body>{paragraphs}</body></html>"
+        job, _ = await F.run_job(m, "rd.html", html.encode("utf-8"))
+        assert job.status == "done", job.error
+        assert len(tr.calls) > 1 and "&amp;" in tr.calls[0]["texts"][0]
+        prev = tr.calls[1]["preceding"]
+        assert prev and all("&amp;" not in s and "&amp;" not in o for s, o in prev)
+        assert prev[-1][1].startswith("[KO] R&D budget number")
+    finally:
+        await m.aclose()

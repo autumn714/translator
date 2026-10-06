@@ -225,6 +225,77 @@ def test_pdf_scan_with_page_number_or_stamp_goes_to_vision(tmp_path):
     assert kinds == ["scanned", "scanned", "scanned", "ocr_layer", "digital"]
 
 
+def _slide_pdf(path, *texts: tuple[str, float]):
+    """A slide: a full-bleed picture with white text on top."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (800, 560), (40, 90, 160)).save(buf, "PNG")
+    doc = pymupdf.open()
+    page = doc.new_page(width=842, height=595)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    y = 120.0
+    for text, size in texts:
+        page.insert_text((60, y), text, fontsize=size, color=(1, 1, 1))
+        y += size * 1.8
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def test_pdf_slide_over_full_page_picture_is_digital(tmp_path):
+    slide = _slide_pdf(tmp_path / "s.pdf", ("Hydrogen Strategy 2030", 28), ("Korea Energy Economics Institute", 16))
+    assert [(p.kind, p.texts) for p in P.analyze(slide)] == [
+        ("digital", ["Hydrogen Strategy 2030", "Korea Energy Economics Institute"])]
+    # negligible text over a picture is still a scan: page numbers, a stamp, only short codes
+    for i, texts in enumerate(([("- 12 -", 9)], [("CONFIDENTIAL", 14)], [("Page 3 of 12", 9)],
+                               [(" ".join(f"{chr(65 + k)}{k}" for k in range(24)), 9)])):
+        assert [p.kind for p in P.analyze(_slide_pdf(tmp_path / f"n{i}.pdf", *texts))] == ["scanned"], texts
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vision", [True, False])
+async def test_pdf_slide_is_translated_in_place(tmp_path, vision):
+    slide = _slide_pdf(tmp_path / "s.pdf", ("Hydrogen Strategy 2030", 28), ("Korea Energy Economics Institute", 16))
+    tr = F.FakeTranslator(vision=vision)
+    m = JobManager(settings=F.settings(tmp_path), translator=tr)
+    await m.start()
+    try:
+        job, out = await F.run_job(m, "slide.pdf", slide.read_bytes())
+        assert job.status == "done", job.error
+        assert F.pdf_text(out) == ["[KO] Hydrogen Strategy 2030\n[KO] Korea Energy Economics Institute\n"]
+        assert tr.image_calls == [] and job.warnings == []
+        with pymupdf.open(stream=out, filetype="pdf") as d:
+            assert len(d[0].get_images()) == 1                                    # the picture stays
+    finally:
+        await m.aclose()
+
+
+@pytest.mark.anyio
+async def test_pdf_scan_without_vision_translates_its_visible_text_in_place(tmp_path):
+    doc = pymupdf.open()
+    for stamp in ("CONFIDENTIAL", None):
+        p = doc.new_page()
+        p.insert_image(p.rect, stream=_scan_png())
+        if stamp:
+            p.insert_text((400, 60), stamp, fontsize=14, color=(1, 0, 0))
+    src = tmp_path / "scan.pdf"
+    doc.save(src)
+    assert [p.kind for p in P.analyze(src)] == ["scanned", "scanned"]
+    m = JobManager(settings=F.settings(tmp_path), translator=F.FakeTranslator(vision=False))
+    await m.start()
+    try:
+        job, out = await F.run_job(m, "scan.pdf", src.read_bytes())
+        assert job.status == "done", job.error
+        pages = F.pdf_text(out)
+        assert len(pages) == 2 and "[KO] CONFIDENTIAL" in pages[0] and pages[1].strip() == ""
+        assert any("1쪽" in w and "이미지 속 글자" in w for w in job.warnings)
+        assert any("2쪽" in w and "번역하지 않았습니다" in w for w in job.warnings)
+        assert job.public().progress.percent == 100.0
+    finally:
+        await m.aclose()
+
+
 def test_pdf_hidden_text_on_digital_page_is_not_a_unit(tmp_path):
     doc = pymupdf.open()
     p = doc.new_page()
@@ -513,6 +584,26 @@ def test_xml_part_limits(tmp_path, monkeypatch):
     with pytest.raises(DocumentError):
         ziputil.rewrite_zip(path, None, lambda n: n == "word/document.xml", lambda n, t: None)
     assert ziputil.MAX_TOTAL_UNCOMPRESSED <= 150 * 1024 * 1024
+
+
+def test_rewrite_zip_pass1_does_not_serialise(tmp_path, monkeypatch):
+    path = tmp_path / "a.docx"
+    path.write_bytes(F.make_minimal_docx(["Hello world"] * 20))
+    dumped: list[int] = []
+    real_dump = ziputil.dump_xml
+
+    def counting_dump(tree):
+        dumped.append(1)
+        return real_dump(tree)
+
+    monkeypatch.setattr(ziputil, "dump_xml", counting_dump)
+    seen: list[str] = []
+    assert ziputil.rewrite_zip(path, None, lambda n: n == "word/document.xml",
+                               lambda n, t: seen.append(n)) == ["word/document.xml"]
+    assert seen == ["word/document.xml"] and dumped == []        # pass 1: transform only
+    out = tmp_path / "b.docx"
+    ziputil.rewrite_zip(path, out, lambda n: n == "word/document.xml", lambda n, t: None)
+    assert dumped == [1] and zipfile.ZipFile(out).read("word/document.xml")
 
 
 # ====================================================================== image EXIF

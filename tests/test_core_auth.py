@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -82,10 +83,45 @@ def test_login_throttle_serializes_failures() -> None:
     async def scenario() -> float:
         throttle = LoginThrottle(delay=0.05)
         started = time.perf_counter()
-        await asyncio.gather(*(throttle.failed() for _ in range(4)))
+        results = await asyncio.gather(*(throttle.attempt(lambda: False) for _ in range(4)))
+        assert results == [False] * 4
         return time.perf_counter() - started
 
     assert asyncio.run(scenario()) >= 0.19  # one failure at a time
+
+
+@pytest.mark.anyio
+async def test_concurrent_login_guesses_are_checked_one_per_delay(tmp_path, monkeypatch) -> None:
+    import translator_app.routers.system as system
+
+    delay = 0.2
+    app = create_app(make_settings(tmp_path, ui_auth="1", ui_user="keei", ui_password="s3cret-pass"))
+    app.state.login_throttle = LoginThrottle(delay=delay)
+    checks: list[tuple[float, bool]] = []
+    real_check = system.check_credentials
+
+    def counting(settings, username, password):  # noqa: ANN001, ANN202
+        ok = real_check(settings, username, password)
+        checks.append((time.perf_counter(), ok))
+        return ok
+
+    monkeypatch.setattr(system, "check_credentials", counting)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        def attempt(password: str) -> asyncio.Task:
+            return asyncio.create_task(client.post("/api/login", json={"username": "keei", "password": password}))
+
+        guesses = [attempt(f"guess-{i}") for i in range(8)]
+        right = attempt("s3cret-pass")
+        await asyncio.sleep(delay * 2.5)
+        assert len(checks) <= 3  # the password is checked under the lock: not all nine at once
+        responses = await asyncio.gather(*guesses)
+        accepted = await right
+    assert [r.status_code for r in responses] == [401] * 8 and accepted.status_code == 200
+    assert len(checks) == 9 and sum(ok for _, ok in checks) == 1
+    gaps_after_failures = [later - earlier for (earlier, ok), (later, _) in zip(checks, checks[1:]) if not ok]
+    assert gaps_after_failures and min(gaps_after_failures) >= delay * 0.9
+    assert LoginThrottle().delay == 1.0  # production: about one guess per second for all clients together
 
 
 def test_login_without_auth_is_a_no_op(mock_client) -> None:

@@ -103,9 +103,10 @@ async def login(payload: LoginRequest, request: Request) -> JSONResponse:
     settings = request.app.state.settings
     if not settings.ui_auth:
         return JSONResponse({"ok": True, "user": None})
-    if not check_credentials(settings, payload.username.strip(), payload.password):
+    username, password = payload.username.strip(), payload.password
+    # checked under the global lock; a wrong one holds it for a second: one guess per second for everyone
+    if not await request.app.state.login_throttle.attempt(lambda: check_credentials(settings, username, password)):
         logger.warning("로그인 실패")
-        await request.app.state.login_throttle.failed()  # wrong guesses: one per second for everyone
         raise HTTPException(status_code=401, detail=MSG_LOGIN_FAILED)
     response = JSONResponse({"ok": True, "user": settings.ui_user})
     response.set_cookie(

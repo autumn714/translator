@@ -168,6 +168,38 @@ if R selftest; then pass "run.sh selftest"
 elif [[ "${E2E_SELFTEST:-required}" == "optional" ]]; then note "run.sh selftest 실패 (E2E_SELFTEST=optional 이라 결과에서 뺌)"
 else fail "run.sh selftest"; fi
 
+title "문서 파일 권한 (data/jobs)"
+# shellcheck disable=SC2329  # check 로 부른다
+doc_job_kept() {  # 앱 안에서 작은 문서 하나를 번역해 두고 지우지 않는다
+  docker exec translator-app python -c '
+import json, sys, time
+from translator_app import selftest as s
+c = s.Client("http://127.0.0.1:7860")
+if not s.login_if_needed(c, s.Report()):
+    sys.exit(1)
+options = json.dumps({"source_lang": "en", "target_lang": "ko", "output": "translated"})
+body, ctype = s.multipart({"options": options}, "e2e-mode.txt", s.make_txt())
+status, raw = c.call("POST", "/api/documents", data=body, headers={"Content-Type": ctype})
+job = json.loads(raw)
+for _ in range(120):
+    status, job = c.json("GET", "/api/documents/" + job["id"])
+    if job.get("status") in s.TERMINAL:
+        break
+    time.sleep(0.5)
+sys.exit(job.get("status") != "done")
+' >/dev/null 2>&1
+}
+# shellcheck disable=SC2016,SC2329  # runner 안의 sh 가 푼다, check 로 부른다
+jobs_private() {  # runner 안에서 stat 으로: data/jobs 아래 폴더는 모두 700, 파일은 모두 600 (파일이 있어야 함)
+  docker exec e2e-runner sh -c '
+    [ -n "$(find data/jobs -type f | head -n 1)" ] || { echo "    data/jobs 에 파일이 없음"; exit 1; }
+    bad=$(find data/jobs -type d -exec stat -c "%a %n" {} + | grep -v "^700 "; find data/jobs -type f -exec stat -c "%a %n" {} + | grep -v "^600 ")
+    if [ -n "$bad" ]; then echo "$bad" | sed "s/^/    /"; exit 1; fi
+    echo "    폴더 $(find data/jobs -type d | wc -l)개 · 파일 $(find data/jobs -type f | wc -l)개"'
+}
+check "문서 번역 작업 하나 남겨 두기" doc_job_kept
+check "data/jobs 폴더 700 · 파일 600" jobs_private
+
 title "모델 서버 없이 시작 (도면 분석기가 꺼진 상태)"
 docker rm -f e2e-fake-vllm >/dev/null
 out=$(R start 2>&1); rc=$?; echo "$out"

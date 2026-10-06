@@ -22,12 +22,27 @@ function save() {
   if (!items.length) store.remove(KEY_ITEMS);
 }
 
-// The newest record is replaced only by a continuation of the same draft (typing on or deleting at the end),
+// The newest record is replaced only by an edit of the same draft (typing on, deleting at the end, or a
+// change in the middle that keeps the shared start and end at 80 % or more of the shorter text),
 // not by a different text that merely starts the same way.
+const MERGE_SHARED = 0.8;
+
+function sharedEnds(a, b) {
+  const limit = Math.min(a.length, b.length);
+  let prefix = 0;
+  while (prefix < limit && a[prefix] === b[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < limit - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix += 1;
+  return prefix + suffix;
+}
+
 export function sameDraft(previous, next, now = Date.now()) {
   if (!previous || previous.target_lang !== next.target_lang) return false;
   if (now - previous.ts > MERGE_WINDOW_MS) return false;
-  return next.source.startsWith(previous.source) || previous.source.startsWith(next.source);
+  const a = previous.source;
+  const b = next.source;
+  if (b.startsWith(a) || a.startsWith(b)) return true;
+  return sharedEnds(a, b) >= MERGE_SHARED * Math.min(a.length, b.length);
 }
 
 export function recordTranslation(entry) {

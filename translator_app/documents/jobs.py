@@ -45,6 +45,7 @@ from translator_app.documents.base import (
     HandlerResult,
     has_tags,
     needs_translation,
+    plain_output,
     strip_tags,
 )
 from translator_app.documents.report import build_report
@@ -794,7 +795,7 @@ class JobManager:
                 outs = await self._translate_chunk(job, opts, chunk, preceding)
                 table.update(zip(chunk, outs))
                 tail = list(zip(chunk, outs))[-PRECEDING_PAIRS:]
-                preceding = [(strip_tags(s), strip_tags(o)) for s, o in tail]
+                preceding = [(strip_tags(s), plain_output(s, o)) for s, o in tail]   # "R&amp;D" → "R&D"
                 self._unit_done(job, len(chunk), sum(len(strip_tags(s)) for s in chunk))
 
         parallel = int(getattr(self.settings, "llm_doc_parallel", 1) or 1)
