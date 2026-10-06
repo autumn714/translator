@@ -1,20 +1,23 @@
 """Optional cookie login (UI_AUTH=1)."""
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import make_settings
-from translator_app.auth import COOKIE_NAME, LoginRateLimiter, SessionSigner, is_exempt
+from translator_app.auth import COOKIE_NAME, LoginThrottle, SessionSigner, is_exempt
 from translator_app.main import create_app
 
 
 @pytest.fixture
 def auth_client(tmp_path):
     settings = make_settings(tmp_path, ui_auth="1", ui_user="keei", ui_password="s3cret-pass")
-    with TestClient(create_app(settings), follow_redirects=False) as client:
+    app = create_app(settings)
+    app.state.login_throttle = LoginThrottle(delay=0.01)  # keep wrong-password tests fast
+    with TestClient(app, follow_redirects=False) as client:
         yield client
 
 
@@ -54,8 +57,8 @@ def test_login_sets_a_signed_cookie_and_unlocks_the_api(auth_client) -> None:
 def test_tampered_or_expired_cookie_is_rejected(auth_client) -> None:
     signer: SessionSigner = auth_client.app.state.session_signer
     token = signer.issue("keei")
-    user, issued, signature = token.split("|")
-    auth_client.cookies.set(COOKIE_NAME, f"{user}|{int(issued) + 1}|{signature}")
+    user, issued, session_id, signature = token.split("|")
+    auth_client.cookies.set(COOKIE_NAME, f"{user}|{int(issued) + 1}|{session_id}|{signature}")
     assert auth_client.get("/api/status").status_code == 401
     auth_client.cookies.set(COOKIE_NAME, signer.issue("keei", now=time.time() - 13 * 3600))
     assert auth_client.get("/api/status").status_code == 401
@@ -68,22 +71,21 @@ def test_tampered_or_expired_cookie_is_rejected(auth_client) -> None:
     assert auth_client.get("/api/status").status_code == 200
 
 
-def test_login_rate_limit(auth_client) -> None:
-    for _ in range(10):
+def test_wrong_passwords_never_lock_out_the_right_one(auth_client) -> None:
+    # every browser arrives from the gate's address: failures must not lock everyone out
+    for _ in range(12):
         assert login(auth_client, password="nope").status_code == 401
-    blocked = login(auth_client)
-    assert blocked.status_code == 429 and "잠시 후" in blocked.json()["detail"]
+    assert login(auth_client).status_code == 200
 
 
-def test_rate_limiter_window_and_reset() -> None:
-    limiter = LoginRateLimiter(limit=2, window=10)
-    limiter.failure("a", now=0)
-    limiter.failure("a", now=1)
-    assert limiter.blocked("a", now=2) and not limiter.blocked("b", now=2)
-    assert not limiter.blocked("a", now=12)
-    limiter.failure("a", now=13)
-    limiter.success("a")
-    assert not limiter.blocked("a", now=13)
+def test_login_throttle_serializes_failures() -> None:
+    async def scenario() -> float:
+        throttle = LoginThrottle(delay=0.05)
+        started = time.perf_counter()
+        await asyncio.gather(*(throttle.failed() for _ in range(4)))
+        return time.perf_counter() - started
+
+    assert asyncio.run(scenario()) >= 0.19  # one failure at a time
 
 
 def test_login_without_auth_is_a_no_op(mock_client) -> None:

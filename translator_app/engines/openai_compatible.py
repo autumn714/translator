@@ -50,6 +50,7 @@ class OpenAICompatibleEngine(TranslationEngine):
         tags: bool = False,
         strict_tags: str | None = None,
         retry: bool = False,
+        meta: dict[str, Any] | None = None,
     ) -> str:
         messages = prompts.translation_messages(text, spec, tags=tags, strict_tags=strict_tags)
         sampling = STRICT_SAMPLING if strict_tags else self._translate_sampling
@@ -66,6 +67,8 @@ class OpenAICompatibleEngine(TranslationEngine):
         )
         if result.finish_reason in RETRY_FINISH_REASONS:
             logger.warning("번역 출력이 끊겼습니다 (%s, 원문 %d자)", result.finish_reason, len(text))
+        if meta is not None:
+            meta["finish_reason"] = result.finish_reason
         return result.content
 
     async def stream_unit(

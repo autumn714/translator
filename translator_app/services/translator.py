@@ -45,7 +45,9 @@ from translator_app.schemas import (
 )
 from translator_app.services.glossary import GlossaryStore, match_glossary_entries, normalize_language_code
 from translator_app.services.language_detection import (
+    DetectedLanguageStat,
     DetectionSummary,
+    chinese_script_counts,
     detect_source_languages,
     resolve_source_language,
 )
@@ -111,6 +113,25 @@ def _keep_outer_whitespace(source: str, translated: str) -> str:
     lead = source[: len(source) - len(source.lstrip())]
     trail = source[len(source.rstrip()):]
     return f"{lead}{translated.strip()}{trail}"
+
+
+def _cacheable(result: str, meta: dict[str, Any]) -> bool:
+    """Empty or cut-off outputs are returned once but never cached (the next request tries again)."""
+    return bool(result.strip()) and meta.get("finish_reason") not in RETRY_FINISH_REASONS
+
+
+def _given_language(text: str, code: str) -> DetectionSummary:
+    """Detection summary for an explicitly chosen source language (never "mixed" from a misdetection)."""
+    count = sum(1 for char in text if not char.isspace())
+    if not count:
+        return DetectionSummary(mode="unknown", primary_language=None, languages=[])
+    return DetectionSummary(mode="single", primary_language=code,
+                            languages=[DetectedLanguageStat(code=code, char_count=count, share=1.0)])
+
+
+async def _detect(text: str) -> DetectionSummary:
+    """Language detection off the event loop (langdetect is pure-Python CPU work)."""
+    return await asyncio.to_thread(detect_source_languages, text)
 
 
 def _fail_future(future: asyncio.Future[Any], exc: BaseException) -> None:
@@ -242,9 +263,10 @@ class TranslatorService:
         while len(self._cache) > limit:
             self._cache.popitem(last=False)
 
-    async def _shared(self, key: tuple[Any, ...], produce: Callable[[], Awaitable[str]]) -> tuple[str, bool]:
+    async def _shared(self, key: tuple[Any, ...], produce: Callable[[], Awaitable[str]],
+                      cacheable: Callable[[str], bool] | None = None) -> tuple[str, bool]:
         """Result for ``key`` from the cache, from an identical request already running, or by
-        running ``produce``. Returns (text, produced_here)."""
+        running ``produce`` (cached only if ``cacheable(result)``). Returns (text, produced_here)."""
         while True:
             cached = self._cache_get(key)
             if cached is not None:
@@ -267,7 +289,8 @@ class TranslatorService:
             _fail_future(future, exc)
             raise
         else:
-            self._cache_put(key, result)
+            if cacheable is None or cacheable(result):
+                self._cache_put(key, result)
             future.set_result(result)
             return result, True
         finally:
@@ -279,20 +302,38 @@ class TranslatorService:
         return ("unit", spec.cache_key(), text)
 
     async def _translate_unit_cached(self, text: str, spec: TranslationSpec, priority: Priority) -> str:
-        async def produce() -> str:
-            return (await self.engine.translate_unit(text, spec, priority=priority)).strip()
+        meta: dict[str, Any] = {}
 
-        result, _ = await self._shared(self._unit_key(text, spec), produce)
+        async def produce() -> str:
+            result = (await self.engine.translate_unit(text, spec, priority=priority, meta=meta)).strip()
+            if not result:
+                # empty answer (e.g. only a leaked <think> block): one retry, like the streaming path
+                result = (await self.engine.translate_unit(text, spec, priority=priority, retry=True,
+                                                           meta=meta)).strip()
+            return result
+
+        result, _ = await self._shared(self._unit_key(text, spec), produce,
+                                       cacheable=lambda value: _cacheable(value, meta))
         return result
 
     # ------------------------------------------------------------------ preparation
     async def _prepare(self, text: str, opts: TranslateOptions) -> _Prepared:
         normalized = normalize_line_breaks(text)
-        detection = detect_source_languages(normalized)
-        source_lang = resolve_source_language(opts.source_lang, detection)
-        if source_lang != "auto":
-            source_lang = normalize_language_code(source_lang)
+        requested = normalize_language_code(opts.source_lang or "auto") or "auto"
+        if requested == "auto":
+            detection = await _detect(normalized)
+            source_lang = resolve_source_language("auto", detection)
+            if source_lang != "auto":
+                source_lang = normalize_language_code(source_lang)
+        else:
+            source_lang = requested
+            detection = _given_language(normalized, source_lang)
         identity = source_lang != "auto" and source_lang == opts.target_lang
+        if identity and requested == "auto" and source_lang in ("zh-Hans", "zh-Hant"):
+            # detected Chinese in one script but the text also has characters of the other script:
+            # let the model convert instead of returning the input unchanged
+            traditional, simplified = chinese_script_counts(normalized)
+            identity = (simplified if source_lang == "zh-Hant" else traditional) == 0
         entries, glossary_name = await self._glossary_source(opts)
         hits: list[GlossaryEntry] = []
         if entries and not identity:
@@ -441,9 +482,10 @@ class TranslatorService:
 
     async def _stream_unit_task(self, index: int, text: str, spec: TranslationSpec,
                                 queue: asyncio.Queue[dict[str, Any]]) -> None:
+        meta: dict[str, Any] = {}
+
         async def produce() -> str:
             pieces: list[str] = []
-            meta: dict[str, Any] = {}
             async with aclosing(self.engine.stream_unit(text, spec, priority="interactive", meta=meta)) as stream:
                 async for piece in stream:
                     pieces.append(piece)
@@ -451,11 +493,13 @@ class TranslatorService:
             result = "".join(pieces).strip()
             if meta.get("finish_reason") in RETRY_FINISH_REASONS or not result:
                 # looped / truncated / empty stream: one non-stream retry (the unit event replaces the text)
-                result = (await self.engine.translate_unit(text, spec, priority="interactive", retry=True)).strip()
+                result = (await self.engine.translate_unit(text, spec, priority="interactive", retry=True,
+                                                           meta=meta)).strip()
             return result
 
         try:
-            result, produced = await self._shared(self._unit_key(text, spec), produce)
+            result, produced = await self._shared(self._unit_key(text, spec), produce,
+                                                  cacheable=lambda value: _cacheable(value, meta))
             if not produced:
                 queue.put_nowait({"type": "delta", "index": index, "text": result})
             queue.put_nowait({"type": "unit", "index": index, "text": result})
@@ -658,7 +702,7 @@ class TranslatorService:
             return []
         source_lang = req.source_lang or "auto"
         if source_lang == "auto" and req.source.strip():
-            source_lang = resolve_source_language("auto", detect_source_languages(req.source))
+            source_lang = resolve_source_language("auto", await _detect(req.source))
         hits, _ = await self.resolve_glossary(req.model_copy(update={"source_lang": source_lang}),
                                               req.source or req.translation)
         spec = TranslationSpec(
@@ -681,9 +725,9 @@ class TranslatorService:
 
     async def rewrite(self, req: RewriteRequest) -> RewriteResponse:
         text = normalize_line_breaks(req.text)
-        lang: str | None = req.lang if req.lang and req.lang != "auto" else None
+        lang: str | None = normalize_language_code(req.lang) if req.lang and req.lang != "auto" else None
         if lang is None and text.strip():
-            detection = detect_source_languages(text)
+            detection = await _detect(text)
             lang = detection.primary_language or (detection.languages[0].code if detection.languages else None)
         if not text.strip():
             return RewriteResponse(text="", detected_lang=lang)
@@ -694,7 +738,7 @@ class TranslatorService:
         term = req.term.strip()
         source_lang = req.source_lang or "auto"
         if source_lang == "auto":
-            source_lang = resolve_source_language("auto", detect_source_languages(f"{term} {req.context}".strip()))
+            source_lang = resolve_source_language("auto", await _detect(f"{term} {req.context}".strip()))
         value = await self.engine.lookup(term, req.context, source_lang, req.target_lang)
         entries: list[LookupEntry] = []
         for item in value.get("entries") or []:

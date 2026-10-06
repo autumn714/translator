@@ -303,18 +303,24 @@ def prepare_image(data: bytes, mime: str | None = None) -> tuple[bytes, str]:
         with Image.open(io.BytesIO(data)) as probe:
             fmt = (probe.format or "").upper()
             width, height = probe.size
+            try:
+                orientation = int(probe.getexif().get(0x0112, 1) or 1)
+            except Exception:  # noqa: BLE001 - broken EXIF: treat as upright
+                orientation = 1
     except Exception as exc:  # noqa: BLE001 - any decoder error
         raise ValueError("이미지를 읽을 수 없습니다.") from exc
 
     detected_mime = {"PNG": "image/png", "JPEG": "image/jpeg"}.get(fmt, "")
     fits = width * height <= MAX_IMAGE_PIXELS and max(width, height) <= MAX_IMAGE_SIDE
-    if fits and detected_mime in _PASSTHROUGH_MIME:
+    # the model server does not apply EXIF rotation: rotated photos are always re-encoded upright
+    if fits and detected_mime in _PASSTHROUGH_MIME and orientation == 1:
         return data, detected_mime
 
     try:
         with Image.open(io.BytesIO(data)) as img:
             img = ImageOps.exif_transpose(img)
             img.load()
+            width, height = img.size  # after rotation (a portrait photo stored landscape + EXIF 6)
             scale = min(1.0, (MAX_IMAGE_PIXELS / float(width * height)) ** 0.5, MAX_IMAGE_SIDE / float(max(width, height)))
             if scale < 1.0:
                 size = (max(1, int(width * scale)), max(1, int(height * scale)))

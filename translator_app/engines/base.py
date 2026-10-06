@@ -37,8 +37,10 @@ class TranslationEngine:
         tags: bool = False,
         strict_tags: str | None = None,
         retry: bool = False,
+        meta: dict[str, Any] | None = None,
     ) -> str:
-        """Translate one unit. ``strict_tags`` → temperature 0 + tag reminder; ``retry`` → anti-repetition."""
+        """Translate one unit. ``strict_tags`` → temperature 0 + tag reminder; ``retry`` → anti-repetition.
+        ``meta["finish_reason"]`` is set when ``meta`` is given."""
         raise NotImplementedError
 
     async def stream_unit(

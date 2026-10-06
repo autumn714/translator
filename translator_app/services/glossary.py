@@ -7,6 +7,7 @@ import re
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
+from functools import lru_cache
 from json import JSONDecodeError
 from pathlib import Path
 from threading import Lock
@@ -14,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from translator_app.languages import LANGUAGE_MAP
 from translator_app.schemas import GlossaryDocument, GlossaryEntry, GlossarySummary
 
 
@@ -203,7 +205,7 @@ def match_glossary_entries(
     target_lang: str,
     source_lang: str = "auto",
 ) -> list[GlossaryEntry]:
-    lowered = text.lower()
+    haystack = _Haystack(text)
     matches = []
     normalized_target_lang = _normalize_language_code(target_lang)
     normalized_source_lang = _normalize_language_code(source_lang)
@@ -214,21 +216,112 @@ def match_glossary_entries(
             continue
         if normalized_source_lang != "auto" and _normalize_language_code(entry.source_lang) != normalized_source_lang:
             continue
-        if entry.source.lower() in lowered:
+        if haystack.contains(entry.source):
             matches.append(entry)
     matches.sort(key=lambda item: len(item.source), reverse=True)
     return matches
 
 
+# Scripts written without spaces between words (or with particles glued to words, like Korean):
+# a term there is a plain substring. Other scripts match whole words only ("AI" is not in "maintain").
+_SPACELESS_SCRIPT = re.compile(
+    "[\u0e00-\u0e7f\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff"
+    "\uac00-\ud7af\uf900-\ufaff\uff66-\uff9d]"
+)
+
+
+_WORD_SUFFIXES = ("", "s", "es", "'s", "’s")  # plural / possessive
+_ACRONYM_SUFFIXES = ("", "s")
+
+
+@lru_cache(maxsize=8192)
+def _term_rule(term: str) -> tuple[str, str]:
+    """(needle, mode): mode "substring" (spaceless scripts), "acronym" (case-sensitive whole word,
+    so "IT" does not match the word "it") or "word" (case-insensitive whole word)."""
+    needle = " ".join(term.split())
+    if not needle or _SPACELESS_SCRIPT.search(needle):
+        return needle.lower(), "substring"
+    letters = [char for char in needle if char.isalpha()]
+    if len(letters) >= 2 and all(char.isupper() for char in letters):
+        return needle, "acronym"
+    return needle.lower(), "word"
+
+
+def _is_word_char(char: str) -> bool:
+    return char.isalnum() or char == "_"
+
+
+def _find_word(haystack: str, needle: str, suffixes: tuple[str, ...]) -> bool:
+    """``needle`` as a whole word (optionally followed by one of ``suffixes``) somewhere in ``haystack``."""
+    check_start = _is_word_char(needle[0])
+    check_end = _is_word_char(needle[-1])
+    allowed = suffixes if needle[-1].isalpha() else ("",)
+    index = haystack.find(needle)
+    while index != -1:
+        if not (check_start and index > 0 and _is_word_char(haystack[index - 1])):
+            if not check_end:
+                return True
+            end = index + len(needle)
+            for suffix in allowed:
+                stop = end + len(suffix)
+                if haystack.startswith(suffix, end) and (stop >= len(haystack) or not _is_word_char(haystack[stop])):
+                    return True
+        index = haystack.find(needle, index + 1)
+    return False
+
+
+class _Haystack:
+    """A text prepared once for many term look-ups (whitespace runs collapsed to one space)."""
+
+    __slots__ = ("lowered", "text")
+
+    def __init__(self, text: str) -> None:
+        self.text = " ".join(text.split())
+        self.lowered = self.text.lower()
+
+    def contains(self, term: str) -> bool:
+        needle, mode = _term_rule(term)
+        if not needle:
+            return False
+        if mode == "substring":
+            return needle in self.lowered
+        if mode == "acronym":
+            return _find_word(self.text, needle, _ACRONYM_SUFFIXES)
+        return _find_word(self.lowered, needle, _WORD_SUFFIXES)
+
+
+def term_occurs(term: str, text: str) -> bool:
+    """True if the glossary source ``term`` occurs in ``text`` (whole words in space-delimited scripts)."""
+    return _Haystack(text).contains(term)
+
+
+_LANGUAGE_ALIASES = {
+    "zh": "zh-Hans",
+    "zh-cn": "zh-Hans",
+    "zh-sg": "zh-Hans",
+    "zh-tw": "zh-Hant",
+    "zh-hk": "zh-Hant",
+    "zh-mo": "zh-Hant",
+    "iw": "he",
+}
+_LANGUAGE_INDEX = {code.lower(): code for code in LANGUAGE_MAP}
+
+
 def _normalize_language_code(code: str) -> str:
-    lowered = code.strip()
-    aliases = {
-        "zh": "zh-Hans",
-        "zh-cn": "zh-Hans",
-        "zh-tw": "zh-Hant",
-        "iw": "he",
-    }
-    return aliases.get(lowered.lower(), lowered)
+    """Case-insensitive mapping to a supported code: 'EN' → 'en', 'en-US' → 'en', 'zh-hans' → 'zh-Hans',
+    'zh-TW' → 'zh-Hant'. Unknown codes are returned as given (trimmed) so validation can name them."""
+    stripped = code.strip()
+    lowered = stripped.lower().replace("_", "-")
+    if lowered == "auto":
+        return "auto"
+    parts = lowered.split("-")
+    for size in range(len(parts), 0, -1):
+        candidate = "-".join(parts[:size])
+        if candidate in _LANGUAGE_ALIASES:
+            return _LANGUAGE_ALIASES[candidate]
+        if candidate in _LANGUAGE_INDEX:
+            return _LANGUAGE_INDEX[candidate]
+    return stripped
 
 
 def normalize_language_code(code: str) -> str:

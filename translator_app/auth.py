@@ -1,17 +1,20 @@
 """Optional cookie login (UI_AUTH=1).
 
-Cookie ``translator_session`` = ``<user b64>|<issued_at>|<HMAC-SHA256 hex>``, HttpOnly, SameSite=Lax,
-valid for 12 hours. No Secure flag: the app is served over plain HTTP inside the LAN.
+Cookie ``translator_session`` = ``<user b64>|<issued_at>|<session id>|<HMAC-SHA256 hex>``, HttpOnly,
+SameSite=Lax, valid for 12 hours. No Secure flag: the app is served over plain HTTP inside the LAN.
+The HMAC key is SESSION_SECRET bound to a fingerprint of UI_USER/UI_PASSWORD, so changing the password
+invalidates every cookie; logout revokes the cookie's session id on the server.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
 import json
+import secrets
 import time
-from collections import deque
 from typing import Any
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -20,19 +23,25 @@ from translator_app.config import Settings
 
 COOKIE_NAME = "translator_session"
 SESSION_TTL_SECONDS = 12 * 3600
-LOGIN_FAILURE_LIMIT = 10
-LOGIN_FAILURE_WINDOW = 300.0
+LOGIN_FAILURE_DELAY = 1.0
+MAX_REVOKED_SESSIONS = 50_000
 
 MSG_LOGIN_REQUIRED = "로그인이 필요합니다."
 MSG_LOGIN_FAILED = "아이디 또는 비밀번호가 올바르지 않습니다."
-MSG_LOGIN_LOCKED = "로그인 시도가 너무 많습니다. 잠시 후 다시 시도하세요."
 
 EXEMPT_PATHS = frozenset({"/login", "/api/login", "/api/logout", "/health", "/static/styles.css"})
 EXEMPT_PREFIXES = ("/static/login.",)
 
 
 def is_exempt(path: str) -> bool:
-    return path in EXEMPT_PATHS or path.startswith(EXEMPT_PREFIXES)
+    if path in EXEMPT_PATHS:
+        return True
+    for prefix in EXEMPT_PREFIXES:
+        if path.startswith(prefix):
+            # only a file directly named login.* — never a path that climbs out of it ("/static/login./../x")
+            rest = path[len(prefix):]
+            return bool(rest) and "/" not in rest and "\\" not in rest and ".." not in rest
+    return False
 
 
 def _b64(value: str) -> str:
@@ -44,24 +53,32 @@ def _unb64(value: str) -> str:
     return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
 
 
+def session_signing_key(settings: Settings) -> bytes:
+    """SESSION_SECRET bound to the current credentials: a new UI_USER / UI_PASSWORD invalidates old cookies."""
+    fingerprint = hashlib.sha256(f"{settings.ui_user}\0{settings.ui_password}".encode("utf-8")).digest()
+    return hmac.new(settings.session_key, b"translator-session\0" + fingerprint, hashlib.sha256).digest()
+
+
 class SessionSigner:
     def __init__(self, key: bytes, *, ttl: int = SESSION_TTL_SECONDS) -> None:
         self._key = key
         self.ttl = ttl
+        self._revoked: dict[str, float] = {}  # session id -> time after which the token expires anyway
 
     def _sign(self, payload: str) -> str:
         return hmac.new(self._key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def issue(self, user: str, *, now: float | None = None) -> str:
-        payload = f"{_b64(user)}|{int(now if now is not None else time.time())}"
+        issued = int(now if now is not None else time.time())
+        payload = f"{_b64(user)}|{issued}|{secrets.token_urlsafe(12)}"
         return f"{payload}|{self._sign(payload)}"
 
-    def verify(self, token: str | None, *, now: float | None = None) -> str | None:
-        """User name if the token is authentic and not expired."""
-        if not token or token.count("|") != 2:
+    def _parse(self, token: str | None, now: float | None) -> tuple[str, int, str] | None:
+        """(user, issued_at, session id) if the token is authentic and not expired."""
+        if not token or token.count("|") != 3:
             return None
-        user_part, issued_part, signature = token.split("|")
-        expected = self._sign(f"{user_part}|{issued_part}")
+        user_part, issued_part, session_id, signature = token.split("|")
+        expected = self._sign(f"{user_part}|{issued_part}|{session_id}")
         if not hmac.compare_digest(expected.encode("ascii"), signature.encode("ascii", "replace")):
             return None
         try:
@@ -72,7 +89,28 @@ class SessionSigner:
         current = time.time() if now is None else now
         if issued > current + 60 or current - issued > self.ttl:
             return None
-        return user
+        return user, issued, session_id
+
+    def verify(self, token: str | None, *, now: float | None = None) -> str | None:
+        """User name if the token is authentic, not expired and not logged out."""
+        parsed = self._parse(token, now)
+        if parsed is None or parsed[2] in self._revoked:
+            return None
+        return parsed[0]
+
+    def revoke(self, token: str | None, *, now: float | None = None) -> bool:
+        """Log the session out on the server (only authentic tokens are remembered)."""
+        parsed = self._parse(token, now)
+        if parsed is None:
+            return False
+        current = time.time() if now is None else now
+        expired = [sid for sid, until in self._revoked.items() if until < current]
+        for sid in expired:
+            del self._revoked[sid]
+        while len(self._revoked) >= MAX_REVOKED_SESSIONS:
+            del self._revoked[min(self._revoked, key=self._revoked.__getitem__)]
+        self._revoked[parsed[2]] = parsed[1] + self.ttl + 60
+        return True
 
 
 def check_credentials(settings: Settings, username: str, password: str) -> bool:
@@ -82,43 +120,37 @@ def check_credentials(settings: Settings, username: str, password: str) -> bool:
     return user_ok and pass_ok and bool(settings.ui_password)
 
 
-class LoginRateLimiter:
-    """In-memory: at most LOGIN_FAILURE_LIMIT failures per client within LOGIN_FAILURE_WINDOW seconds."""
+class LoginThrottle:
+    """Global brake for wrong passwords. Every failed login waits ``delay`` seconds while holding one
+    lock, so wrong guesses are answered one at a time (about one per second for all clients together).
+    A correct login never waits. There is no per-client lockout: every browser reaches the app through
+    the gate's address, so a lockout would lock everyone out."""
 
-    def __init__(self, limit: int = LOGIN_FAILURE_LIMIT, window: float = LOGIN_FAILURE_WINDOW) -> None:
-        self.limit = limit
-        self.window = window
-        self._failures: dict[str, deque[float]] = {}
+    def __init__(self, delay: float = LOGIN_FAILURE_DELAY) -> None:
+        self.delay = delay
+        self._lock: asyncio.Lock | None = None
 
-    def _prune(self, client: str, now: float) -> deque[float]:
-        bucket = self._failures.setdefault(client, deque())
-        while bucket and now - bucket[0] > self.window:
-            bucket.popleft()
-        if len(self._failures) > 10000:  # bound memory
-            for key in [k for k, v in self._failures.items() if not v]:
-                del self._failures[key]
-        return bucket
-
-    def blocked(self, client: str, *, now: float | None = None) -> bool:
-        return len(self._prune(client, time.monotonic() if now is None else now)) >= self.limit
-
-    def failure(self, client: str, *, now: float | None = None) -> None:
-        current = time.monotonic() if now is None else now
-        self._prune(client, current).append(current)
-
-    def success(self, client: str) -> None:
-        self._failures.pop(client, None)
+    async def failed(self) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            await asyncio.sleep(self.delay)
 
 
-def session_user_from_scope(scope: Scope, signer: SessionSigner) -> str | None:
+def session_token_from_scope(scope: Scope) -> str | None:
     for name, value in scope.get("headers") or []:
         if name != b"cookie":
             continue
         for part in value.decode("latin-1").split(";"):
             key, sep, raw = part.strip().partition("=")
             if sep and key == COOKIE_NAME:
-                return signer.verify(raw.strip().strip('"'))
+                return raw.strip().strip('"')
     return None
+
+
+def session_user_from_scope(scope: Scope, signer: SessionSigner) -> str | None:
+    token = session_token_from_scope(scope)
+    return signer.verify(token) if token is not None else None
 
 
 class AuthMiddleware:

@@ -11,9 +11,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from translator_app.auth import (
     COOKIE_NAME,
     MSG_LOGIN_FAILED,
-    MSG_LOGIN_LOCKED,
     SESSION_TTL_SECONDS,
     check_credentials,
+    session_token_from_scope,
     session_user_from_scope,
 )
 from translator_app.schemas import AuthStatus, LimitsStatus, LoginRequest, ModelStatus, StatusResponse
@@ -41,8 +41,9 @@ password:document.getElementById("p").value})});if(r.ok){location.replace("/");r
 catch(e){}document.getElementById("e").textContent=d||"로그인하지 못했습니다.";};</script></body></html>"""
 
 
-def _client_id(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+def vision_available(request: Request) -> bool:
+    llm = getattr(request.app.state, "llm", None)
+    return True if llm is None else bool(llm.vision_enabled)
 
 
 def document_formats(request: Request) -> list[dict[str, Any]]:
@@ -53,7 +54,8 @@ def document_formats(request: Request) -> list[dict[str, Any]]:
     except ImportError:
         return []
     try:
-        return list(supported_formats())
+        # without vision the model cannot read images: do not offer image formats
+        return list(supported_formats(vision=vision_available(request)))
     except Exception:  # noqa: BLE001 - status must never fail
         logger.exception("문서 형식 목록을 읽지 못했습니다")
         return []
@@ -101,15 +103,10 @@ async def login(payload: LoginRequest, request: Request) -> JSONResponse:
     settings = request.app.state.settings
     if not settings.ui_auth:
         return JSONResponse({"ok": True, "user": None})
-    limiter = request.app.state.login_limiter
-    client = _client_id(request)
-    if limiter.blocked(client):
-        raise HTTPException(status_code=429, detail=MSG_LOGIN_LOCKED)
     if not check_credentials(settings, payload.username.strip(), payload.password):
-        limiter.failure(client)
-        logger.warning("로그인 실패 (%s)", client)
+        logger.warning("로그인 실패")
+        await request.app.state.login_throttle.failed()  # wrong guesses: one per second for everyone
         raise HTTPException(status_code=401, detail=MSG_LOGIN_FAILED)
-    limiter.success(client)
     response = JSONResponse({"ok": True, "user": settings.ui_user})
     response.set_cookie(
         COOKIE_NAME,
@@ -124,7 +121,10 @@ async def login(payload: LoginRequest, request: Request) -> JSONResponse:
 
 
 @router.post("/api/logout")
-async def logout() -> JSONResponse:
+async def logout(request: Request) -> JSONResponse:
+    token = session_token_from_scope(request.scope)
+    if token is not None:
+        request.app.state.session_signer.revoke(token)  # a copied cookie stops working too
     response = JSONResponse({"ok": True})
     response.delete_cookie(COOKIE_NAME, path="/", httponly=True, samesite="lax")
     return response

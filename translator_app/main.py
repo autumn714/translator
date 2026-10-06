@@ -7,15 +7,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from translator_app.auth import AuthMiddleware, LoginRateLimiter, SessionSigner
+from translator_app.auth import AuthMiddleware, LoginThrottle, SessionSigner, session_signing_key
 from translator_app.config import Settings, get_settings
 from translator_app.engines.factory import build_engine
 from translator_app.languages import LANGUAGES
@@ -41,8 +42,33 @@ def _setup_logging() -> None:
     logger.propagate = False
 
 
+MSG_TOO_LARGE = "요청이 너무 큽니다."
+MSG_FORBIDDEN = "허용되지 않은 요청입니다."
+MSG_DOCUMENTS_UNAVAILABLE = "문서 번역 기능을 사용할 수 없습니다."
+
+
+async def _send_json(send: Send, status: int, detail: str, *, close: bool = False) -> None:
+    body = json.dumps({"detail": detail}, ensure_ascii=False).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json; charset=utf-8"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if close:
+        headers.append((b"connection", b"close"))
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class BodyTooLarge(HTTPException):
+    """Raised from ``receive`` once a request body passes its limit (also for chunked bodies)."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail=MSG_TOO_LARGE, headers={"Connection": "close"})
+
+
 class BodySizeLimit:
-    """Reject requests whose Content-Length is obviously too large (413) before reading them."""
+    """413 for request bodies above the route's limit: at once when Content-Length says so, otherwise
+    as soon as the received bytes pass the limit (chunked bodies have no Content-Length)."""
 
     def __init__(self, app: ASGIApp, *, document_bytes: int, import_bytes: int, default_bytes: int) -> None:
         self.app = app
@@ -58,23 +84,84 @@ class BodySizeLimit:
         return self.default_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            for name, value in scope.get("headers") or []:
-                if name == b"content-length":
-                    try:
-                        length = int(value)
-                    except ValueError:
-                        length = 0
-                    if length > self._limit(scope.get("path", "")):
-                        body = json.dumps({"detail": "요청이 너무 큽니다."}, ensure_ascii=False).encode("utf-8")
-                        await send({"type": "http.response.start", "status": 413, "headers": [
-                            (b"content-type", b"application/json; charset=utf-8"),
-                            (b"content-length", str(len(body)).encode("ascii")),
-                            (b"connection", b"close"),
-                        ]})
-                        await send({"type": "http.response.body", "body": body})
-                        return
-                    break
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self._limit(scope.get("path", ""))
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    length = int(value)
+                except ValueError:
+                    length = 0
+                if length > limit:
+                    await _send_json(send, 413, MSG_TOO_LARGE, close=True)
+                    return
+                break
+
+        received = 0
+        exceeded = False
+        started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received, exceeded
+            if exceeded:
+                raise BodyTooLarge()
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    exceeded = True
+                    raise BodyTooLarge()
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except BodyTooLarge:
+            if not started:
+                await _send_json(send, 413, MSG_TOO_LARGE, close=True)
+
+
+class SameOriginGuard:
+    """CSRF guard (login is off by default): state-changing /api/ requests sent by another site are
+    refused (403) — ``Sec-Fetch-Site: cross-site``, or an ``Origin`` whose host:port differs from
+    ``Host``. Requests without Origin (curl, scripts, the self-test) pass; CORS_ALLOW_ORIGINS are allowed."""
+
+    UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def __init__(self, app: ASGIApp, *, allowed_origins: list[str] | None = None) -> None:
+        self.app = app
+        self.allowed = {origin.rstrip("/").lower() for origin in allowed_origins or []}
+
+    def _forbidden(self, scope: Scope) -> bool:
+        headers: dict[bytes, str] = {}
+        for name, value in scope.get("headers") or []:
+            headers.setdefault(name, value.decode("latin-1").strip())
+        origin = headers.get(b"origin")
+        if origin is not None and origin.rstrip("/").lower() in self.allowed:
+            return False
+        if headers.get(b"sec-fetch-site", "").lower() == "cross-site":
+            return True
+        if origin is None:
+            return False
+        host = headers.get(b"host", "").lower()
+        try:
+            origin_host = urlsplit(origin).netloc.lower()
+        except ValueError:
+            return True
+        return not host or origin_host != host
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (scope["type"] == "http" and scope.get("method") in self.UNSAFE_METHODS
+                and scope.get("path", "").startswith("/api/") and self._forbidden(scope)):
+            await _send_json(send, 403, MSG_FORBIDDEN)
+            return
         await self.app(scope, receive, send)
 
 
@@ -134,8 +221,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.translator = translator
     app.state.job_manager = job_manager
-    app.state.session_signer = SessionSigner(settings.session_key)
-    app.state.login_limiter = LoginRateLimiter()
+    app.state.session_signer = SessionSigner(session_signing_key(settings))
+    app.state.login_throttle = LoginThrottle()
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -152,6 +239,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(glossaries_router)
     if documents_router is not None:
         app.include_router(documents_router)
+    else:
+        @app.api_route("/api/documents", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        @app.api_route("/api/documents/{rest:path}", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+        async def documents_unavailable() -> JSONResponse:
+            return JSONResponse(status_code=503, content={"detail": MSG_DOCUMENTS_UNAVAILABLE})
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -166,7 +258,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             headers={"Cache-Control": "no-cache"},
         )
 
-    # middleware: the last added runs first → size check, CORS, then the login gate
+    # middleware: the last added runs first → size check, same-origin check, CORS, then the login gate
     if settings.ui_auth:
         if not settings.ui_password:
             logger.error("UI_AUTH=1 이지만 UI_PASSWORD 가 비어 있어 아무도 로그인할 수 없습니다.")
@@ -179,6 +271,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_headers=["*"],
             allow_credentials=True,
         )
+    app.add_middleware(SameOriginGuard, allowed_origins=settings.cors_origin_list)
     app.add_middleware(
         BodySizeLimit,
         document_bytes=(settings.doc_max_mb + 2) * 1024 * 1024,

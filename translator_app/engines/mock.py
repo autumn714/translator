@@ -39,8 +39,11 @@ class MockEngine(TranslationEngine):
         tags: bool = False,
         strict_tags: str | None = None,
         retry: bool = False,
+        meta: dict[str, Any] | None = None,
     ) -> str:
         await asyncio.sleep(0)
+        if meta is not None:
+            meta["finish_reason"] = "stop"
         return mock_translate(text, spec.target_lang)
 
     async def stream_unit(

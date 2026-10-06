@@ -1,12 +1,13 @@
 """Text translation API: /api/translate, /api/translate/stream, /api/alternatives, /api/rewrite, /api/lookup."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import aclosing
 from functools import partial
-from typing import Any
+from typing import Any, TypeVar
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request
@@ -31,6 +32,9 @@ from translator_app.services.translator import GlossaryNotFound, TranslatorServi
 
 logger = logging.getLogger("translator.api")
 router = APIRouter(tags=["translate"])
+
+T = TypeVar("T")
+MSG_CLIENT_GONE = "요청이 취소되었습니다."
 
 
 def get_translator(request: Request) -> TranslatorService:
@@ -77,6 +81,35 @@ def _check_text(request: Request, text: str) -> None:
         raise HTTPException(status_code=413, detail=f"텍스트가 너무 깁니다 (최대 {limit:,}자).")
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+async def until_disconnect(request: Request, aw: Awaitable[T]) -> T:
+    """Await ``aw`` (the body is already read); if the client goes away first, cancel it — this
+    closes the upstream LLM request, so vLLM stops generating text nobody will read."""
+    work = asyncio.ensure_future(aw)
+    listener = asyncio.ensure_future(_wait_for_disconnect(request))
+    try:
+        await asyncio.wait({work, listener}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        work.cancel()
+        listener.cancel()
+        await asyncio.gather(work, listener, return_exceptions=True)
+        raise
+    if work.done():
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
+        return work.result()
+    work.cancel()
+    await asyncio.gather(work, return_exceptions=True)
+    logger.info("클라이언트 연결이 끊겨 요청을 취소했습니다 (%s)", request.url.path)
+    raise HTTPException(status_code=499, detail=MSG_CLIENT_GONE)
+
+
 class NDJSONResponse(StreamingResponse):
     """Streams NDJSON and stops the generator as soon as the client disconnects
     (also while nothing is being sent yet), so upstream LLM requests are aborted."""
@@ -110,7 +143,10 @@ async def translate(payload: TranslationRequest, request: Request) -> Translatio
     _check_text(request, payload.text)
     check_languages(payload.source_lang, payload.target_lang)
     try:
-        return await get_translator(request).translate_text(payload.text, _normalized(payload))
+        return await until_disconnect(request, get_translator(request).translate_text(payload.text,
+                                                                                      _normalized(payload)))
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise http_error(exc) from exc
 
@@ -139,7 +175,10 @@ async def translate_stream(payload: TranslationRequest, request: Request) -> Str
 async def alternatives(payload: AlternativesRequest, request: Request) -> AlternativesResponse:
     check_languages(payload.source_lang, payload.target_lang)
     try:
-        items = await get_translator(request).alternatives(_normalized(payload))  # type: ignore[arg-type]
+        items = await until_disconnect(request, get_translator(request).alternatives(
+            _normalized(payload)))  # type: ignore[arg-type]
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise http_error(exc) from exc
     return AlternativesResponse(alternatives=items)
@@ -147,10 +186,14 @@ async def alternatives(payload: AlternativesRequest, request: Request) -> Altern
 
 @router.post("/api/rewrite", response_model=RewriteResponse)
 async def rewrite(payload: RewriteRequest, request: Request) -> RewriteResponse:
-    if payload.lang and payload.lang != "auto" and not _known(payload.lang):
-        raise HTTPException(status_code=400, detail=f"지원하지 않는 언어입니다: {payload.lang}")
+    if payload.lang and payload.lang != "auto":
+        if not _known(payload.lang):
+            raise HTTPException(status_code=400, detail=f"지원하지 않는 언어입니다: {payload.lang}")
+        payload = payload.model_copy(update={"lang": normalize_language_code(payload.lang)})
     try:
-        return await get_translator(request).rewrite(payload)
+        return await until_disconnect(request, get_translator(request).rewrite(payload))
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise http_error(exc) from exc
 
@@ -160,7 +203,12 @@ async def lookup(payload: LookupRequest, request: Request) -> LookupResponse:
     if not payload.term.strip():
         raise HTTPException(status_code=400, detail="찾을 단어를 입력하세요.")
     check_languages(payload.source_lang, payload.target_lang)
+    update: dict[str, Any] = {"target_lang": normalize_language_code(payload.target_lang)}
+    if payload.source_lang and payload.source_lang != "auto":
+        update["source_lang"] = normalize_language_code(payload.source_lang)
     try:
-        return await get_translator(request).lookup(payload)
+        return await until_disconnect(request, get_translator(request).lookup(payload.model_copy(update=update)))
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise http_error(exc) from exc

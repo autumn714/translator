@@ -80,7 +80,14 @@ def _split_long_paragraph(paragraph: str, *, max_chars: int) -> list[str]:
 
 # ---------------------------------------------------------------- interactive units (v2)
 _PARAGRAPH_SPLIT = re.compile(r"\n[ \t]*\n")
-_SENTENCE_END = re.compile(r"(?<=[.!?。！？…])\s+|\n")
+# Latin terminators need whitespace after them ("e.g. 3.5"); full-width CJK terminators end a sentence
+# by themselves (Chinese/Japanese put no space after 。！？), also when a closing bracket/quote follows.
+_SENTENCE_END = re.compile(
+    r"(?<=[。！？])(?![」』）)”’〕】》。！？])\s*"
+    r"|(?<=[。！？][」』）)”’〕】》])\s*"
+    r"|(?<=[.!?…])\s+"
+    r"|\n"
+)
 _SOFT_BREAK = re.compile(r"\s+")
 
 

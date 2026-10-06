@@ -10,6 +10,9 @@ from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
+TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
 def _env(*names: str) -> AliasChoices:
     return AliasChoices(*names)
 
@@ -63,6 +66,8 @@ class Settings(BaseSettings):
     doc_max_chars: int = Field(default=600000, ge=1, validation_alias=_env("DOC_MAX_CHARS", "doc_max_chars"))
     doc_retention_hours: int = Field(default=24, ge=1, validation_alias=_env("DOC_RETENTION_HOURS", "doc_retention_hours"))
     doc_job_concurrency: int = Field(default=2, ge=1, validation_alias=_env("DOC_JOB_CONCURRENCY", "doc_job_concurrency"))
+    # total size of data/jobs (uploads + results) in MB; new uploads are refused beyond it
+    doc_disk_quota_mb: int = Field(default=2048, ge=1, validation_alias=_env("DOC_DISK_QUOTA_MB", "doc_disk_quota_mb"))
 
     ui_auth: bool = Field(default=False, validation_alias=_env("UI_AUTH", "ui_auth"))
     ui_user: str = Field(default="translator", validation_alias=_env("UI_USER", "ui_user"))
@@ -86,7 +91,7 @@ class Settings(BaseSettings):
         "doc_max_chars",
         "doc_retention_hours",
         "doc_job_concurrency",
-        "ui_auth",
+        "doc_disk_quota_mb",
         mode="before",
     )
     @classmethod
@@ -96,6 +101,20 @@ class Settings(BaseSettings):
             assert info.field_name is not None
             return cls.model_fields[info.field_name].get_default(call_default_factory=True)
         return value
+
+    @field_validator("ui_auth", mode="before")
+    @classmethod
+    def _parse_ui_auth(cls, value: Any) -> Any:
+        # same rule as scripts/lib.sh: only 1/true/yes/on (any case) turn the login on; anything else is off
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, (int, float)):
+            return value == 1
+        if isinstance(value, str):
+            return value.strip().lower() in TRUTHY
+        return False
 
     @field_validator("llm_extra_body", mode="before")
     @classmethod
