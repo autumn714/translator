@@ -2,7 +2,10 @@
 
 Uploads are parsed from the request stream and written straight to the job
 directory in chunks, so a file larger than DOC_MAX_MB is rejected (413) as soon
-as the limit is crossed, without spooling the whole body anywhere first.
+as the limit is crossed, without spooling the whole body anywhere first.  The
+whole body is bounded too (chunked requests carry no Content-Length): at most a
+few parts, only the "options" field is kept, and DOC_DISK_QUOTA_MB is checked
+while the file streams in (507).
 """
 from __future__ import annotations
 
@@ -21,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
 from translator_app.documents.base import DocumentError
-from translator_app.documents.jobs import Job, JobManager, sanitize_filename
+from translator_app.documents.jobs import MSG_DISK_FULL, Job, JobManager, sanitize_filename
 from translator_app.documents.schemas import (
     DocumentJob,
     DocumentJobList,
@@ -35,9 +38,12 @@ logger = logging.getLogger("translator.documents")
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 MAX_FIELD_BYTES = 64 * 1024            # the "options" JSON
+MAX_HEADER_BYTES = 8 * 1024            # headers of one multipart part
+MAX_PARTS = 8                          # "file" + "options" (+ a few the browser may add)
+BODY_OVERHEAD = 256 * 1024             # boundaries and part headers on top of file + options
 MAX_LIST_IDS = 100
 
-MSG_UNAVAILABLE = "문서 번역 기능을 사용할 수 없습니다. 서버 로그를 확인하세요."
+MSG_UNAVAILABLE = "문서 번역 기능을 사용할 수 없습니다."
 MSG_NOT_FOUND = "작업을 찾을 수 없습니다. 보관 기간이 지나 삭제되었을 수 있습니다."
 MSG_NOT_DONE = "번역이 아직 끝나지 않았습니다."
 MSG_NO_FILE = "파일을 첨부해 주세요."
@@ -104,6 +110,10 @@ class _UploadTooLarge(Exception):
     pass
 
 
+class _DiskFull(Exception):
+    pass
+
+
 class _BadUpload(Exception):
     pass
 
@@ -120,20 +130,31 @@ async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, 
         raise _BadUpload(MSG_BAD_FORM)
 
     limit = manager.max_bytes
+    body_limit = limit + MAX_FIELD_BYTES + BODY_OVERHEAD
     state: dict[str, Any] = {"hname": b"", "hvalue": b"", "disp": b"", "name": None, "is_file": False,
-                             "buf": bytearray(), "done_file": False}
+                             "buf": bytearray(), "done_file": False, "parts": 0, "hbytes": 0}
     fields: dict[str, str] = {}
     file_info: dict[str, Any] = {"filename": None, "size": 0, "pending": []}
     tmp = manager.new_upload_path()
     fh = None
 
     def on_part_begin() -> None:
-        state.update(disp=b"", name=None, is_file=False, buf=bytearray(), hname=b"", hvalue=b"")
+        state["parts"] += 1
+        if state["parts"] > MAX_PARTS:
+            raise _BadUpload(MSG_BAD_FORM)
+        state.update(disp=b"", name=None, is_file=False, buf=bytearray(), hname=b"", hvalue=b"", hbytes=0)
+
+    def _header_bytes(n: int) -> None:
+        state["hbytes"] += n
+        if state["hbytes"] > MAX_HEADER_BYTES:
+            raise _BadUpload(MSG_BAD_FORM)
 
     def on_header_field(data: bytes, start: int, end: int) -> None:
+        _header_bytes(end - start)
         state["hname"] += data[start:end]
 
     def on_header_value(data: bytes, start: int, end: int) -> None:
+        _header_bytes(end - start)
         state["hvalue"] += data[start:end]
 
     def on_header_end() -> None:
@@ -155,7 +176,7 @@ async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, 
             if file_info["size"] > limit:
                 raise _UploadTooLarge()
             file_info["pending"].append(chunk)
-        elif state["name"] is not None:
+        elif state["name"] == "options":                # any other field is read past, not kept
             if len(state["buf"]) + len(chunk) > MAX_FIELD_BYTES:
                 raise _BadUpload(MSG_BAD_OPTIONS)
             state["buf"] += chunk
@@ -164,21 +185,28 @@ async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, 
         if state["is_file"]:
             state["done_file"] = True
             state["is_file"] = False
-        elif state["name"]:
-            fields[state["name"]] = bytes(state["buf"]).decode("utf-8", "replace")
+        elif state["name"] == "options":
+            fields["options"] = bytes(state["buf"]).decode("utf-8", "replace")
 
     parser = MultipartParser(boundary, {
         "on_part_begin": on_part_begin, "on_part_data": on_part_data, "on_part_end": on_part_end,
         "on_header_field": on_header_field, "on_header_value": on_header_value,
         "on_header_end": on_header_end, "on_headers_finished": on_headers_finished,
     })
+    token = await asyncio.to_thread(manager.begin_upload)
+    received = 0
     try:
         fh = await asyncio.to_thread(open, tmp, "wb")
         async for chunk in request.stream():
+            received += len(chunk)
+            if received > body_limit:
+                raise _UploadTooLarge()
             parser.write(chunk)
             if file_info["pending"]:
                 data = b"".join(file_info["pending"])
                 file_info["pending"].clear()
+                if not manager.track_upload(token, file_info["size"]):
+                    raise _DiskFull()
                 await asyncio.to_thread(fh.write, data)
         parser.finalize()
         await asyncio.to_thread(fh.close)
@@ -191,6 +219,8 @@ async def _receive_upload(request: Request, manager: JobManager) -> tuple[Path, 
         if isinstance(exc, FormParserError):
             raise _BadUpload(MSG_BAD_FORM) from exc
         raise
+    finally:
+        manager.end_upload(token)
     if not state["done_file"] or (not file_info["filename"] and file_info["size"] == 0):
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -212,6 +242,8 @@ async def upload_document(request: Request) -> Any:
     except _UploadTooLarge:
         return JSONResponse(status_code=413, content={"detail": _limit_message(max_mb)},
                             headers={"Connection": "close"})
+    except _DiskFull:
+        return JSONResponse(status_code=507, content={"detail": MSG_DISK_FULL}, headers={"Connection": "close"})
     except _BadUpload as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:

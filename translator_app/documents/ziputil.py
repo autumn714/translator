@@ -5,12 +5,16 @@
 - Zip packages are checked before use: member count, total declared size and
   member names (no absolute paths / ``..``).  ``zipfile`` never yields more than
   the declared size of a member, so the size check bounds memory use.
+- An lxml tree needs about 20x the size of its XML in memory, so every parsed
+  part is capped in bytes and in elements (a sub-1 MB zip can declare a part of
+  hundreds of MB made of tiny empty elements).
 - ``rewrite_zip`` keeps member order, names, timestamps and compression type
   (HWPX/ODF ``mimetype`` stays first and STORED) and copies untouched members
   with identical content.
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import zipfile
@@ -21,7 +25,9 @@ from lxml import etree
 from translator_app.documents.base import MSG_BROKEN, DocumentError
 
 MAX_MEMBERS = 5000
-MAX_TOTAL_UNCOMPRESSED = 500 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED = 150 * 1024 * 1024
+MAX_XML_PART_BYTES = 48 * 1024 * 1024        # one parsed XML part
+MAX_XML_ELEMENTS = 4_000_000                  # ≈ 450 MB of lxml nodes at most
 OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 PARSER = etree.XMLParser(
@@ -39,9 +45,34 @@ MSG_UNSAFE_ZIP = "압축 구조가 안전하지 않은 파일입니다."
 MSG_ZIP_TOO_BIG = "압축을 풀면 너무 큰 파일입니다."
 
 
+def _count_elements(data: bytes, limit: int) -> int:
+    """Element count with a streaming parse that frees the nodes it has seen."""
+    n = 0
+    events = etree.iterparse(io.BytesIO(data), events=("end",), resolve_entities=False, no_network=True,
+                             huge_tree=False, load_dtd=False)
+    try:
+        for _ev, el in events:
+            n += 1
+            if n > limit:
+                break
+            el.clear(keep_tail=True)
+            parent = el.getparent()
+            if parent is not None:
+                while el.getprevious() is not None:
+                    del parent[0]
+    except etree.XMLSyntaxError as exc:
+        raise DocumentError(MSG_BROKEN) from exc
+    return n
+
+
 def parse_xml(data: bytes):
     if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         raise DocumentError(MSG_UNSAFE_XML)
+    if len(data) > MAX_XML_PART_BYTES:
+        raise DocumentError(MSG_ZIP_TOO_BIG)
+    # every element has at least one "<": only count exactly when that bound is exceeded
+    if data.count(b"<") > MAX_XML_ELEMENTS and _count_elements(data, MAX_XML_ELEMENTS) > MAX_XML_ELEMENTS:
+        raise DocumentError(MSG_ZIP_TOO_BIG)
     try:
         root = etree.fromstring(data, PARSER)
     except etree.XMLSyntaxError as exc:
@@ -121,6 +152,8 @@ def rewrite_zip(
                 selected = select(info.filename)
                 if zout is None and not selected:
                     continue
+                if selected and info.file_size > MAX_XML_PART_BYTES:
+                    raise DocumentError(MSG_ZIP_TOO_BIG)
                 data = zin.read(info.filename)
                 if selected:
                     tree = parse_xml(data)

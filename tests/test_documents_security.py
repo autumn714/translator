@@ -27,11 +27,12 @@ def _write(tmp_path, name: str, data: bytes):
 def test_zip_member_limits(tmp_path, monkeypatch):
     p = _write(tmp_path, "a.docx", F.make_minimal_docx(["Hello world"]))
     check_zip(p, ("word/document.xml",))
+    default = ziputil.MAX_TOTAL_UNCOMPRESSED
     monkeypatch.setattr(ziputil, "MAX_TOTAL_UNCOMPRESSED", 100)
     with pytest.raises(DocumentError) as e:
         check_zip(p, ("word/document.xml",))
     assert "너무 큰" in e.value.message
-    monkeypatch.setattr(ziputil, "MAX_TOTAL_UNCOMPRESSED", 500 * 1024 * 1024)
+    monkeypatch.setattr(ziputil, "MAX_TOTAL_UNCOMPRESSED", default)
     monkeypatch.setattr(ziputil, "MAX_MEMBERS", 2)
     with pytest.raises(DocumentError):
         check_zip(p, ("word/document.xml",))

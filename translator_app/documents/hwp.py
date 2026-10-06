@@ -39,12 +39,18 @@ INLINE_CTRL = {4, 5, 6, 7, 8, 9, 19, 20}                            # 8 code uni
 EXTENDED_CTRL = {1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23}   # 8 code units
 CHAR_MAP = {9: "\t", 10: "\n", 24: "-", 30: " ", 31: " "}
 
-MAX_SECTION_BYTES = 256 * 1024 * 1024          # decompressed size limit per section
+# A tiny .hwp can hold huge sections of tiny records, so extraction has one shared
+# budget for all sections (decompressed bytes, records, paragraphs, text).
+MAX_TOTAL_BYTES = 128 * 1024 * 1024            # decompressed BodyText, all sections together
+MAX_RECORDS = 4_000_000
+MAX_PARAGRAPHS = 200_000
+MAX_PARA_BYTES = 2 * 1024 * 1024               # one PARA_TEXT record (≈ 1M characters)
 
 MSG_HWP_PASSWORD = "암호가 걸린 한글 문서입니다. 한글에서 암호를 해제한 뒤 다시 올려 주세요."
 MSG_HWP_DISTRIBUTION = "배포용 한글 문서는 내용을 읽을 수 없습니다. 한글에서 일반 문서로 저장해 올려 주세요."
 MSG_HWP_IS_HWPX = "HWPX 형식의 파일입니다. 확장자를 .hwpx 로 바꿔 올려 주세요."
 MSG_HWP_OLD = "한글 97 이전 형식은 지원하지 않습니다. 한글에서 HWPX로 저장해 올려 주세요."
+MSG_HWP_TOO_BIG = "압축을 풀면 너무 큰 파일입니다."
 
 
 def read_header(ole) -> dict:
@@ -95,17 +101,24 @@ def para_text(payload: bytes) -> str:
     return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
 
 
-def _inflate(raw: bytes) -> bytes:
+def _inflate(raw: bytes, limit: int = MAX_TOTAL_BYTES) -> bytes:
     d = zlib.decompressobj(-15)
-    out = d.decompress(raw, MAX_SECTION_BYTES)
-    if d.unconsumed_tail:
-        raise DocumentError("압축을 풀면 너무 큰 파일입니다.")
+    out = d.decompress(raw, max(1, limit))
+    if d.unconsumed_tail or len(out) > limit:
+        raise DocumentError(MSG_HWP_TOO_BIG)
     return out
 
 
-def hwp5_paragraphs(path: str | Path) -> list[tuple[int, str]]:
+def _too_long(limit: int) -> DocumentError:
+    return DocumentError(f"문서가 너무 깁니다. 최대 {limit:,}자까지 번역할 수 있습니다.")
+
+
+def hwp5_paragraphs(path: str | Path, max_chars: int | None = None) -> list[tuple[int, str]]:
     """[(record level, paragraph text)] in stream order; level > 0 = nested
-    (table cells, footnotes, headers, text boxes)."""
+    (table cells, footnotes, headers, text boxes).
+
+    Stops with DocumentError as soon as the shared budget is used up, or when the
+    distinct paragraph text to translate exceeds max_chars."""
     import olefile
 
     path = str(path)
@@ -125,15 +138,36 @@ def hwp5_paragraphs(path: str | Path) -> list[tuple[int, str]]:
             secs = sorted((e for e in ole.listdir() if len(e) == 2 and e[0] == "BodyText"
                            and e[1].startswith("Section") and e[1][7:].isdigit()), key=lambda e: int(e[1][7:]))
             out: list[tuple[int, str]] = []
+            budget = MAX_TOTAL_BYTES
+            records = 0
+            seen: set[str] = set()
+            chars = 0
             for e in secs:
                 raw = ole.openstream(e).read()
                 try:
-                    data = _inflate(raw) if info["compressed"] else raw
+                    data = _inflate(raw, budget) if info["compressed"] else raw
                 except zlib.error as exc:
                     raise DocumentError(MSG_BROKEN) from exc
+                budget -= len(data)
+                if budget < 0:
+                    raise DocumentError(MSG_HWP_TOO_BIG)
                 for tag, level, payload in iter_records(data):
-                    if tag == HWPTAG_PARA_TEXT:
-                        out.append((level, para_text(payload)))
+                    records += 1
+                    if records > MAX_RECORDS:
+                        raise DocumentError(MSG_HWP_TOO_BIG)
+                    if tag != HWPTAG_PARA_TEXT:
+                        continue
+                    if len(out) >= MAX_PARAGRAPHS or len(payload) > MAX_PARA_BYTES:
+                        raise DocumentError(MSG_HWP_TOO_BIG)
+                    text = para_text(payload)
+                    out.append((level, text))
+                    key = text.strip()
+                    if max_chars is not None and key not in seen and has_letters(key):
+                        seen.add(key)
+                        chars += len(key)
+                        if chars > max_chars:
+                            raise _too_long(max_chars)
+                del data
             return out
     except DocumentError:
         raise
@@ -168,7 +202,7 @@ class HwpHandler:
 
     async def run(self, ctx: HandlerContext) -> HandlerResult:
         ctx.set_status("extracting")
-        paras = await asyncio.to_thread(hwp5_paragraphs, ctx.input_path)
+        paras = await asyncio.to_thread(hwp5_paragraphs, ctx.input_path, ctx.max_chars)
         ctx.check_cancel()
         texts = list(dict.fromkeys(t.strip() for _, t in paras if has_letters(t)))
         if not texts:

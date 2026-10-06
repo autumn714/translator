@@ -65,6 +65,15 @@ def strip_tags(s: str) -> str:
     return html.unescape(TAG_RE.sub("", s))
 
 
+def plain_output(src: str, out: str) -> str:
+    """Plain text of a translation.  A tagged source was HTML-escaped by the encoder,
+    so its translation is unescaped even when the model dropped every tag
+    (strip_tags alone would keep 'R&amp;D')."""
+    if TAG_RE.search(src):
+        return html.unescape(TAG_RE.sub("", out))
+    return strip_tags(out)
+
+
 def tag_signature(s: str) -> Counter:
     return Counter(m.group(0) for m in TAG_RE.finditer(s))
 
@@ -202,8 +211,8 @@ class TwoPassHandler:
 def preview_from_pairs(pairs: list[tuple[str, str]], limit: int = 20_000) -> str:
     out: list[str] = []
     n = 0
-    for _, tgt in pairs:
-        t = strip_tags(tgt).strip()
+    for src, tgt in pairs:
+        t = plain_output(src, tgt).strip()
         if not t:
             continue
         out.append(t)

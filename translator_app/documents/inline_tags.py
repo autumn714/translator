@@ -204,7 +204,8 @@ def apply_ops(adapter: Adapter, para, enc: Encoded, ops) -> None:
 
 def fallback(adapter: Adapter, enc: Encoded, out: str) -> None:
     texts = [p for p in enc.pieces if p.kind == "text"]
-    plain = strip_tags(out) if enc.tagged else out
+    # tagged sources are HTML-escaped: unescape even when the model dropped every tag
+    plain = html.unescape(_TOK.sub("", out)) if enc.tagged else out
     adapter.set_text(texts[0], plain)
     for p in texts[1:]:
         adapter.set_text(p, "")

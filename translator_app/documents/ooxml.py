@@ -1,23 +1,25 @@
 """In-place DOCX / PPTX / XLSX translation (lxml + zipfile only, no python-docx).
 
-DOCX: document, headers, footers, footnotes, endnotes, comments, SmartArt text;
-      tables, text boxes, hyperlinks, content controls; field codes, deleted text
-      and other non-text objects are kept as untranslated placeholders.
-PPTX: slides, notes, SmartArt text (masters/layouts are not translated).
-XLSX: shared strings (incl. rich text), inline strings, comments, drawing shapes.
-      Formulas, numbers, sheet names and strings used as formula literals are kept;
-      fullCalcOnLoad is set so cached formula results are recomputed on open.
+DOCX: document, headers, footers, footnotes, endnotes, comments, SmartArt text,
+      chart titles; tables, text boxes, hyperlinks, content controls; field codes,
+      deleted text and other non-text objects are kept as untranslated placeholders.
+PPTX: slides, notes, SmartArt text, chart titles (masters/layouts are not translated).
+XLSX: shared strings (incl. rich text), inline strings, comments (also threaded),
+      drawing shapes, chart titles.  Formulas, numbers, sheet names, strings used as
+      formula literals and Excel table column names are kept; fullCalcOnLoad is set
+      so cached formula results are recomputed on open.
 """
 from __future__ import annotations
 
 import copy
+import html as htmllib
 import re
 from pathlib import Path
 
 from lxml import etree
 
-from translator_app.documents.base import DocumentError, HandlerContext, Translate, TwoPassHandler
-from translator_app.documents.inline_tags import Adapter, Piece, translate_paragraphs
+from translator_app.documents.base import DocumentError, HandlerContext, Translate, TwoPassHandler, has_letters
+from translator_app.documents.inline_tags import Adapter, Piece, translate_paragraphs, translate_unique
 from translator_app.documents.ziputil import check_zip, parse_xml, rewrite_zip
 
 # ====================================================================== DOCX
@@ -33,7 +35,8 @@ def w(t: str) -> str:
 
 DOCX_PARTS = re.compile(r"word/(document|header\d*|footer\d*|footnotes|endnotes|comments)\.xml")
 DOCX_BILINGUAL_PARTS = re.compile(r"word/(document|footnotes|endnotes|comments)\.xml")
-DOCX_DIAGRAMS = re.compile(r"word/diagrams/(data|drawing)\d*\.xml")
+# DrawingML text: SmartArt and chart titles / axis titles (c:rich)
+DOCX_DIAGRAMS = re.compile(r"word/(?:diagrams/(?:data|drawing)\d*|charts/chart\d+)\.xml")
 
 TEXTISH = {w("t"), w("tab"), w("br"), w("cr"), w("noBreakHyphen"), w("softHyphen")}
 DROP = {w("lastRenderedPageBreak")}                       # layout cache only
@@ -260,26 +263,54 @@ def _unwrap(el) -> None:
         parent.insert(idx + k, ch)
 
 
+# CT_PPr child order (Word rejects a pPr whose children are out of order)
+_PPR_ORDER = {w(t): i for i, t in enumerate((
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr",
+    "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap",
+    "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
+    "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection",
+    "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange",
+))}
+
+
+def _ppr_put(ppr, el) -> None:
+    """Replace ppr's child of el's tag by el, at its schema position."""
+    for old in ppr.findall(el.tag):
+        ppr.remove(old)
+    rank = _PPR_ORDER[el.tag]
+    idx = 0
+    for i, ch in enumerate(ppr):
+        if _PPR_ORDER.get(ch.tag, len(_PPR_ORDER)) < rank:
+            idx = i + 1
+    ppr.insert(idx, el)
+
+
 def docx_clone_paragraph(p):
     c = copy.deepcopy(p)
     for attr in (f"{{{W14}}}paraId", f"{{{W14}}}textId"):
         c.attrib.pop(attr, None)
     ppr = c.find(w("pPr"))
-    if ppr is not None:
-        for tag in ("sectPr", "pPrChange"):
-            for el in ppr.findall(w(tag)):
-                ppr.remove(el)
-        prpr = ppr.find(w("rPr"))
-        if prpr is not None:
-            for tag in ("ins", "del", "moveFrom", "moveTo", "rPrChange"):
-                for el in prpr.findall(w(tag)):
-                    prpr.remove(el)
-        numpr = ppr.find(w("numPr"))
-        if numpr is not None:                     # the copy must not take a list number
-            for ch in list(numpr):
-                numpr.remove(ch)
-            etree.SubElement(numpr, w("ilvl")).set(w("val"), "0")
-            etree.SubElement(numpr, w("numId")).set(w("val"), "0")
+    if ppr is None:
+        ppr = etree.Element(w("pPr"))
+        c.insert(0, ppr)
+    for tag in ("sectPr", "pPrChange"):
+        for el in ppr.findall(w(tag)):
+            ppr.remove(el)
+    prpr = ppr.find(w("rPr"))
+    if prpr is not None:
+        for tag in ("ins", "del", "moveFrom", "moveTo", "rPrChange"):
+            for el in prpr.findall(w(tag)):
+                prpr.remove(el)
+    # the copy must not take a list number, also not one that comes from the
+    # paragraph style (numbered headings): numId 0 = "no numbering"
+    numpr = etree.Element(w("numPr"))
+    etree.SubElement(numpr, w("ilvl")).set(w("val"), "0")
+    etree.SubElement(numpr, w("numId")).set(w("val"), "0")
+    _ppr_put(ppr, numpr)
+    # nor start yet another page (direct or style-level "page break before")
+    pbb = etree.Element(w("pageBreakBefore"))
+    pbb.set(w("val"), "0")
+    _ppr_put(ppr, pbb)
     for el in list(c.iter()):
         if el is not c and el.tag in _CLONE_DROP_CHILDREN and el.getparent() is not None:
             el.getparent().remove(el)
@@ -325,7 +356,9 @@ def a(t: str) -> str:
     return f"{{{A}}}{t}"
 
 
-PPTX_PARTS = re.compile(r"ppt/(slides/slide|notesSlides/notesSlide|diagrams/data|diagrams/drawing)\d+\.xml")
+PPTX_PARTS = re.compile(
+    r"ppt/(slides/slide|notesSlides/notesSlide|diagrams/data|diagrams/drawing|charts/chart)\d+\.xml"
+)
 IGNORED_RPR_ATTRS = {"lang", "altLang", "dirty", "err", "noProof", "smtClean", "smtId", "bmk"}
 
 
@@ -511,31 +544,125 @@ class StringItemAdapter(Adapter):
 XLSX_SST = "xl/sharedStrings.xml"
 XLSX_SHEET = re.compile(r"xl/worksheets/sheet\d+\.xml")
 XLSX_COMMENTS = re.compile(r"xl/comments\d*\.xml|xl/comments/comment\d+\.xml")
-XLSX_DRAWING = re.compile(r"xl/drawings/drawing\d+\.xml")
+XLSX_THREADED = re.compile(r"xl/threadedComments/threadedComment\d+\.xml")
+XLSX_DRAWING = re.compile(r"xl/(?:drawings/drawing|charts/chart)\d+\.xml")
+XLSX_TABLE = re.compile(r"xl/tables/table\d+\.xml")
+TC = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"
 
 _LIT = re.compile(r'"((?:[^"]|"")*)"')
+# <f>, data-validation <formula1>/<formula2>, conditional-format <formula> (any prefix)
+_F_OPEN = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?(f|formula|formula1|formula2)(?=[\s/>])([^>]*)>")
+_SCAN_CHUNK = 1 << 20
+_MAX_FORMULA = 1 << 20
+
+
+def _add_literals(raw: bytes, is_list: bool, lits: set[str]) -> None:
+    text = htmllib.unescape(raw.decode("utf-8", errors="replace"))
+    for m in _LIT.finditer(text):
+        v = m.group(1).replace('""', '"')
+        lits.add(v)
+        if is_list:                                   # data-validation list "Yes,No"
+            lits.update(x.strip() for x in v.split(","))
+
+
+def _scan_sheet(fh, lits: set[str]) -> bool:
+    """Stream one worksheet: collect formula string literals, return True when it
+    has inline strings.  No DOM: a sheet with millions of cells is read in 1 MB
+    chunks (formula text never contains '<', so the next '<' closes it)."""
+    inline = False
+    buf = b""
+    while True:
+        chunk = fh.read(_SCAN_CHUNK)
+        data = buf + chunk
+        if not inline and b"inlineStr" in data:
+            inline = True
+        pos, pending = 0, None
+        for m in _F_OPEN.finditer(data):
+            if m.group(2).endswith(b"/"):                 # <f t="shared" si="0"/>
+                pos = m.end()
+                continue
+            end = data.find(b"<", m.end())
+            if end < 0:
+                pending = m.start()
+                break
+            _add_literals(data[m.end():end], m.group(1) == b"formula1", lits)
+            pos = end
+        if not chunk:
+            return inline
+        if pending is not None:
+            buf = data[pending:]
+        else:
+            lt = data.rfind(b"<", pos)
+            buf = data[lt:] if lt >= 0 and data.find(b">", lt) < 0 else b""
+        if len(buf) > _MAX_FORMULA:                       # absurdly long tag / formula: skip it
+            buf = b""
+
+
+def scan_sheets(path) -> tuple[set[str], set[str]]:
+    """-> (formula string literals, names of the sheets that hold inline strings)."""
+    import zipfile
+
+    lits: set[str] = set()
+    inline: set[str] = set()
+    with zipfile.ZipFile(path) as z:
+        for n in z.namelist():
+            if XLSX_SHEET.fullmatch(n):
+                with z.open(n) as fh:
+                    if _scan_sheet(fh, lits):
+                        inline.add(n)
+    lits.discard("")
+    return lits, inline
 
 
 def formula_literals(path) -> set[str]:
     """String literals used in formulas / data-validation lists, e.g. =IF(C2="Yes",..)
     or list "Yes,No".  Cells whose whole text equals one of them are left
     untranslated, otherwise the formula logic silently changes."""
+    return scan_sheets(path)[0]
+
+
+def table_header_names(path) -> set[str]:
+    """Column names of Excel tables (ListObjects).  A table's header cells must
+    equal its tableColumn names (also used by structured references such as
+    Table1[Region]); a translated header makes Excel repair the file and drop
+    the table, so these strings are left untranslated."""
     import zipfile
 
-    lits: set[str] = set()
+    names: set[str] = set()
     with zipfile.ZipFile(path) as z:
         for n in z.namelist():
-            if not XLSX_SHEET.fullmatch(n):
+            if not XLSX_TABLE.fullmatch(n):
                 continue
             root = parse_xml(z.read(n)).getroot()
-            for f in list(root.iter(s_("f"))) + list(root.iter(s_("formula1"))):
-                for m in _LIT.finditer(f.text or ""):
-                    v = m.group(1).replace('""', '"')
-                    lits.add(v)
-                    if f.tag == s_("formula1"):
-                        lits.update(x.strip() for x in v.split(","))
-    lits.discard("")
-    return lits
+            if root.get("headerRowCount", "1") == "0":
+                continue
+            for tc in root.iter(s_("tableColumn")):
+                if tc.get("name"):
+                    names.add(xl_unescape(tc.get("name")))
+    return names
+
+
+def _item_text(item) -> str:
+    t = item.find(s_("t"))
+    if t is not None:
+        return xl_unescape(t.text or "")
+    return "".join(xl_unescape(rt.text or "") for rt in item.iterfind(f"{s_('r')}/{s_('t')}"))
+
+
+def _translate_threaded_comments(root, translate: Translate, stats: dict) -> None:
+    """Excel 365 comments: plain <text>; comments with @mentions keep their text
+    (mentions store character offsets into it)."""
+    texts = []
+    for tc in root.iter(f"{{{TC}}}threadedComment"):
+        el = tc.find(f"{{{TC}}}text")
+        if el is not None and tc.find(f"{{{TC}}}mentions") is None and has_letters(el.text or ""):
+            texts.append(el)
+    if not texts:
+        return
+    table = translate_unique([el.text for el in texts], translate)
+    for el in texts:
+        el.text = table[el.text]
+    stats["plain"] = stats.get("plain", 0) + len(texts)
 
 
 def force_full_calc(tree) -> None:
@@ -560,16 +687,19 @@ def translate_xlsx(src, dst, translate: Translate, drawings: bool = True,
                    protect_formula_literals: bool = True, recalc_on_open: bool = True) -> dict:
     stats: dict = {}
     ad = StringItemAdapter()
-    protected = formula_literals(src) if protect_formula_literals else set()
+    # worksheets are scanned as a byte stream (they can hold millions of cells);
+    # only sheets with inline strings are parsed, the others are copied unchanged
+    literals, inline_sheets = scan_sheets(src)
+    protected = (literals if protect_formula_literals else set()) | table_header_names(src)
     stats["protected"] = len(protected)
 
     def keep(item):
-        t = item.find(s_("t"))
-        return not (t is not None and xl_unescape(t.text or "") in protected)
+        return _item_text(item) not in protected
 
     def select(n):
-        return ((recalc_on_open and n == "xl/workbook.xml") or n == XLSX_SST or bool(XLSX_SHEET.fullmatch(n))
-                or bool(XLSX_COMMENTS.fullmatch(n)) or (drawings and bool(XLSX_DRAWING.fullmatch(n))))
+        return ((recalc_on_open and n == "xl/workbook.xml") or n == XLSX_SST or n in inline_sheets
+                or bool(XLSX_COMMENTS.fullmatch(n)) or bool(XLSX_THREADED.fullmatch(n))
+                or (drawings and bool(XLSX_DRAWING.fullmatch(n))))
 
     def tf(name, tree):
         root = tree.getroot()
@@ -580,10 +710,16 @@ def translate_xlsx(src, dst, translate: Translate, drawings: bool = True,
             items = root.findall(s_("si"))
         elif XLSX_SHEET.fullmatch(name):
             # inline strings only; a cell with <f> is a formula -> never touched
-            items = [c.find(s_("is")) for c in root.iter(s_("c"))
-                     if c.get("t") == "inlineStr" and c.find(s_("f")) is None and c.find(s_("is")) is not None]
+            items = []
+            for is_ in root.iter(s_("is")):
+                c = is_.getparent()
+                if c.get("t") == "inlineStr" and c.find(s_("f")) is None:
+                    items.append(is_)
         elif XLSX_COMMENTS.fullmatch(name):
             items = list(root.iter(s_("text")))
+        elif XLSX_THREADED.fullmatch(name):
+            _translate_threaded_comments(root, translate, stats)
+            return
         else:
             translate_drawingml_tree(tree, translate, stats)
             return

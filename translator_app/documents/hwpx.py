@@ -19,7 +19,7 @@ from lxml import etree
 
 from translator_app.documents.base import DocumentError, HandlerContext, Translate, TwoPassHandler
 from translator_app.documents.inline_tags import Adapter, Piece, translate_paragraphs
-from translator_app.documents.ziputil import check_zip, read_member, replace_member, rewrite_zip
+from translator_app.documents.ziputil import check_zip, parse_xml, read_member, replace_member, rewrite_zip
 
 HP = "http://www.hancom.co.kr/hwpml/2011/paragraph"
 
@@ -152,13 +152,70 @@ def _in_header_footer(p) -> bool:
     return any(anc.tag in (hp("header"), hp("footer")) for anc in p.iterancestors())
 
 
-def hwpx_clone_paragraph(p):
+HH = "http://www.hancom.co.kr/hwpml/2011/head"
+HWPX_HEADER = "Contents/header.xml"
+
+
+def hh(t: str) -> str:
+    return f"{{{HH}}}{t}"
+
+
+def _needs_plain_twin(ppr) -> bool:
+    return (any(h.get("type", "NONE") != "NONE" for h in ppr.iter(hh("heading")))
+            or any(b.get("pageBreakBefore") == "1" for b in ppr.iter(hh("breakSetting"))))
+
+
+def plain_para_pr_map(header_root) -> dict[str, str]:
+    """Paragraph shapes with outline / list numbering (개요, 1. 가. …) or 'page break
+    before' -> id of the plain twin that add_plain_para_prs() appends."""
+    props = header_root.find(f".//{hh('paraProperties')}")
+    if props is None:
+        return {}
+    ids = [int(x.get("id")) for x in props.iterfind(hh("paraPr")) if (x.get("id") or "").isdigit()]
+    nxt = max(ids, default=-1) + 1
+    out: dict[str, str] = {}
+    for ppr in props.iterfind(hh("paraPr")):
+        pid = ppr.get("id")
+        if pid is not None and pid not in out and _needs_plain_twin(ppr):
+            out[pid] = str(nxt)
+            nxt += 1
+    return out
+
+
+def add_plain_para_prs(header_root, mapping: dict[str, str]) -> None:
+    props = header_root.find(f".//{hh('paraProperties')}")
+    if props is None or not mapping:
+        return
+    for ppr in list(props.iterfind(hh("paraPr"))):
+        twin_id = mapping.get(ppr.get("id"))
+        if twin_id is None:
+            continue
+        twin = copy.deepcopy(ppr)
+        twin.set("id", twin_id)
+        for h in twin.iter(hh("heading")):
+            h.set("type", "NONE")
+            h.set("idRef", "0")
+            h.set("level", "0")
+        for b in twin.iter(hh("breakSetting")):
+            b.set("pageBreakBefore", "0")
+        twin.tail = None
+        props.append(twin)
+    props.set("itemCnt", str(len(props.findall(hh("paraPr")))))
+
+
+def hwpx_clone_paragraph(p, para_pr_map: dict[str, str] | None = None):
     """Bilingual copy: text runs only (no section/column definitions, tables,
-    pictures, footnotes or other controls, which must stay unique)."""
+    pictures, footnotes or other controls, which must stay unique).  The copy
+    neither starts a new page/column nor takes an outline/list number."""
     if _in_header_footer(p):
         return None
     c = copy.deepcopy(p)
     c.set("id", "0")
+    for attr in ("pageBreak", "columnBreak"):
+        if c.get(attr) is not None:
+            c.set(attr, "0")
+    if para_pr_map and c.get("paraPrIDRef") in para_pr_map:
+        c.set("paraPrIDRef", para_pr_map[c.get("paraPrIDRef")])
     for ls in c.findall(hp("linesegarray")):
         c.remove(ls)
     for run in list(c.iterchildren(hp("run"))):
@@ -192,12 +249,29 @@ def translate_hwpx(src, dst, translate: Translate, *, bilingual: bool = False, d
     stats: dict = {}
     ad = HwpxAdapter()
     preview: list[str] = []
+    para_pr_map: dict[str, str] = {}
+    if bilingual:
+        header = read_member(src, HWPX_HEADER)
+        if header is not None:
+            para_pr_map = plain_para_pr_map(parse_xml(header).getroot())
+
+    def clone(p):
+        return hwpx_clone_paragraph(p, para_pr_map)
 
     def tf(name, tree):
         root = tree.getroot()
+        if name == HWPX_HEADER:
+            add_plain_para_prs(root, para_pr_map)
+            return
         paras = list(root.iter(hp("p")))
         before = {id(p): etree.tostring(p) for p in paras} if drop_lineseg and not bilingual else {}
-        translate_paragraphs(ad, paras, translate, stats, clone=hwpx_clone_paragraph if bilingual else None)
+        if bilingual:
+            # headers/footers are translated in place (as in DOCX); body paragraphs get a copy
+            body = [p for p in paras if not _in_header_footer(p)]
+            translate_paragraphs(ad, body, translate, stats, clone=clone)
+            translate_paragraphs(ad, [p for p in paras if _in_header_footer(p)], translate, stats)
+        else:
+            translate_paragraphs(ad, paras, translate, stats)
         if drop_lineseg:
             # stale layout cache: remove it where text changed (bilingual: everywhere,
             # because inserted paragraphs shift every following line); Hancom recomputes
@@ -214,7 +288,10 @@ def translate_hwpx(src, dst, translate: Translate, *, bilingual: bool = False, d
                 if s.strip():
                     preview.append(s)
 
-    stats["parts"] = rewrite_zip(src, dst, lambda n: bool(HWPX_SECTIONS.fullmatch(n)), tf)
+    def select(n):
+        return bool(HWPX_SECTIONS.fullmatch(n)) or (n == HWPX_HEADER and bool(para_pr_map))
+
+    stats["parts"] = rewrite_zip(src, dst, select, tf)
     if update_preview and dst is not None and read_member(dst, "Preview/PrvText.txt") is not None:
         replace_member(dst, "Preview/PrvText.txt", "\r\n".join(preview)[:1024].encode("utf-8"))
     return stats

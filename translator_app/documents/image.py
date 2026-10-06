@@ -35,8 +35,18 @@ class ImageInfo:
     embed_ext: str                      # "png" | "jpeg"
 
 
+EXIF_ORIENTATION = 0x0112
+
+
+def _orientation(im) -> int:
+    try:
+        return int(im.getexif().get(EXIF_ORIENTATION, 1) or 1)
+    except Exception:  # noqa: BLE001 - broken EXIF block: treat as upright
+        return 1
+
+
 def inspect_image(data: bytes) -> ImageInfo:
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image, ImageOps, UnidentifiedImageError
 
     try:
         with Image.open(io.BytesIO(data)) as im:
@@ -45,13 +55,16 @@ def inspect_image(data: bytes) -> ImageInfo:
                 raise DocumentError(MSG_IMAGE_TOO_BIG)
             im.load()
             fmt = (im.format or "").upper()
-            if fmt in ("PNG", "JPEG") and max(w, h) <= EMBED_MAX_SIDE:
+            rotated = _orientation(im) not in (0, 1)
+            if fmt in ("PNG", "JPEG") and max(w, h) <= EMBED_MAX_SIDE and not rotated:
                 return ImageInfo(w, h, data, "png" if fmt == "PNG" else "jpeg")
-            img = im
             if getattr(im, "n_frames", 1) > 1:
                 im.seek(0)
-            if max(w, h) > EMBED_MAX_SIDE:
-                img = im.copy()
+            # phone photos are stored sideways with an EXIF orientation tag; the copy
+            # in the Word file has no EXIF, so the pixels themselves must be upright
+            img = ImageOps.exif_transpose(im) if rotated else im
+            if max(img.size) > EMBED_MAX_SIDE:
+                img = img.copy() if img is im else img
                 img.thumbnail((EMBED_MAX_SIDE, EMBED_MAX_SIDE))
             buf = io.BytesIO()
             if img.mode in ("RGBA", "LA", "P") or fmt == "PNG":

@@ -9,6 +9,9 @@ Job files live in ``{data_dir}/jobs/<id>/``:
     report.json    rule-based quality report
 
 Privacy: document text and file names are never logged; only ids, extensions and counts.
+Job directories are created 0700 and their files 0600.  A job that fails or is
+canceled loses its input at once (only meta.json stays until it expires), and the
+whole of ``jobs/`` is kept under DOC_DISK_QUOTA_MB (new uploads get 507 beyond it).
 """
 from __future__ import annotations
 
@@ -71,10 +74,52 @@ MSG_NOT_READY = "문서 번역 기능이 준비되지 않았습니다. 잠시 �
 MSG_TOO_MANY = "대기 중인 문서가 너무 많습니다. 잠시 후 다시 올려 주세요."
 MSG_EMPTY_FILE = "빈 파일입니다."
 MSG_CANCELED = "취소되었습니다."
+MSG_DISK_FULL = "서버 저장 공간이 부족합니다. 잠시 후 다시 시도하세요."
+
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+MB = 1024 * 1024
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+    with contextlib.suppress(OSError):
+        os.chmod(path, DIR_MODE)
+
+
+def _write_private(path: Path, data: bytes | str) -> None:
+    """Write a file readable by the owner only (0600, whatever the umask)."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), FILE_MODE)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    with contextlib.suppress(OSError):
+        os.chmod(path, FILE_MODE)
+
+
+def _restrict_files(d: Path) -> None:
+    """Handlers write their output with the default mode: tighten it to 0600."""
+    with contextlib.suppress(OSError):
+        for p in d.iterdir():
+            if p.is_file():
+                with contextlib.suppress(OSError):
+                    os.chmod(p, FILE_MODE)
+
+
+def _tree_size(root: Path, skip: Path | None = None) -> int:
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if skip is not None and Path(dirpath) == skip.parent:
+            dirnames[:] = [n for n in dirnames if n != skip.name]
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+    return total
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -181,6 +226,7 @@ class Job:
     deleted: bool = False
     samples: deque = field(default_factory=lambda: deque(maxlen=400), repr=False)
     last_persist: float = 0.0
+    shown_percent: float = 0.0           # progress never moves backwards on screen
 
     @property
     def source_lang(self) -> str:
@@ -206,7 +252,9 @@ class Job:
             p = 100.0 * self.done / self.total
         else:
             p = 0.0
-        return round(min(p, 99.0), 1)
+        p = max(round(min(p, 99.0), 1), self.shown_percent)
+        self.shown_percent = p
+        return p
 
     def eta_seconds(self) -> int | None:
         if self.status != "translating" or len(self.samples) < 2 or self.chars_total <= 0:
@@ -279,6 +327,8 @@ class JobManager:
         self._running: set[str] = set()
         self._started = False
         self._closing = False
+        self._usage = 0                          # bytes in job directories (refreshed on every change)
+        self._uploads: dict[str, int] = {}       # bytes of uploads still streaming into .incoming
 
     # ------------------------------------------------------------ settings
     @property
@@ -288,6 +338,15 @@ class JobManager:
     @property
     def retention(self) -> timedelta:
         return timedelta(hours=float(self.settings.doc_retention_hours))
+
+    @property
+    def disk_quota(self) -> int:
+        """DOC_DISK_QUOTA_MB: total size of jobs/ (uploads + results)."""
+        try:
+            mb = float(getattr(self.settings, "doc_disk_quota_mb", 2048) or 2048)
+        except (TypeError, ValueError):
+            mb = 2048.0
+        return int(max(mb, 1.0) * MB)
 
     @property
     def font_dir(self) -> Path:
@@ -331,7 +390,7 @@ class JobManager:
         self._started = False
 
     def _load_existing(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        _private_dir(self.root)
         shutil.rmtree(self.incoming, ignore_errors=True)
         now = _now()
         for d in self.root.iterdir():
@@ -356,15 +415,51 @@ class JobManager:
                 job.finished_at = now
                 job.expires_at = now + self.retention
                 self._write_meta(job)
+            # a shorter DOC_RETENTION_HOURS also applies to files kept from before
+            limit = (job.finished_at or job.created_at) + self.retention
+            if job.expires_at > limit:
+                job.expires_at = limit
+                self._write_meta(job)
             if job.expires_at <= now:
                 shutil.rmtree(d, ignore_errors=True)
                 continue
+            if job.status != "done":
+                self._discard_files(d)
+            with contextlib.suppress(OSError):
+                os.chmod(d, DIR_MODE)
+            _restrict_files(d)
             self.jobs[job.id] = job
+        self._refresh_usage()
+
+    # ------------------------------------------------------------ disk quota
+    def _refresh_usage(self) -> None:
+        self._usage = _tree_size(self.root, skip=self.incoming) if self.root.is_dir() else 0
+
+    def disk_used(self) -> int:
+        """Bytes in job directories plus uploads still streaming in."""
+        return self._usage + sum(self._uploads.values())
+
+    def begin_upload(self) -> str:
+        token = uuid.uuid4().hex
+        self._refresh_usage()
+        self._uploads[token] = 0
+        return token
+
+    def track_upload(self, token: str, size: int) -> bool:
+        """Record the bytes received so far. -> False when the quota would be exceeded."""
+        self._uploads[token] = size
+        return self.disk_used() <= self.disk_quota
+
+    def end_upload(self, token: str) -> None:
+        self._uploads.pop(token, None)
 
     # ------------------------------------------------------------ public API
     def new_upload_path(self) -> Path:
-        self.incoming.mkdir(parents=True, exist_ok=True)
-        return self.incoming / f"{uuid.uuid4().hex}.part"
+        _private_dir(self.root)
+        _private_dir(self.incoming)
+        path = self.incoming / f"{uuid.uuid4().hex}.part"
+        _write_private(path, b"")
+        return path
 
     async def submit(self, source: Path | bytes, filename: str,
                      options: DocumentOptions | dict[str, Any] | None = None) -> Job:
@@ -387,16 +482,25 @@ class JobManager:
                 raise DocumentError(f"파일이 너무 큽니다. 최대 {self.settings.doc_max_mb}MB까지 올릴 수 있습니다.", 413)
             if sum(1 for j in self.jobs.values() if j.status in ACTIVE) >= MAX_ACTIVE_JOBS:
                 raise DocumentError(MSG_TOO_MANY, 429)
+            await asyncio.to_thread(self._refresh_usage)
+            if self.disk_used() + size > self.disk_quota:
+                raise DocumentError(MSG_DISK_FULL, 507)
 
             job_id = uuid.uuid4().hex
             d = self.job_dir(job_id)
-            d.mkdir(parents=True)
+            _private_dir(self.root)
+            d.mkdir(mode=DIR_MODE)
+            with contextlib.suppress(OSError):
+                os.chmod(d, DIR_MODE)
             target = d / f"input{ext}"
             if isinstance(source, (bytes, bytearray)):
-                await asyncio.to_thread(target.write_bytes, bytes(source))
+                await asyncio.to_thread(_write_private, target, bytes(source))
             else:
                 await asyncio.to_thread(shutil.move, str(source), str(target))
+                with contextlib.suppress(OSError):
+                    os.chmod(target, FILE_MODE)
             tmp = None
+            self._usage += size
             now = _now()
             job = Job(id=job_id, filename=name, size=size, ext=ext,
                       options=opts.model_dump(mode="json"), created_at=now, expires_at=now + self.retention)
@@ -432,6 +536,8 @@ class JobManager:
             return None
         if job.status == "queued":
             self._finish(job, "canceled", None)
+            await asyncio.to_thread(self._discard_files, self.job_dir(job.id))
+            await asyncio.to_thread(self._refresh_usage)
         elif job.status in ACTIVE:
             job.cancel_event.set()
             for _ in range(50):                          # usually immediate (requests are aborted)
@@ -452,6 +558,7 @@ class JobManager:
             if job.status in ACTIVE:
                 job.status = "canceled"
             await asyncio.to_thread(shutil.rmtree, self.job_dir(job.id), True)
+            await asyncio.to_thread(self._refresh_usage)
         logger.info("문서 작업 삭제 job=%s", job.id)
         return True
 
@@ -486,6 +593,7 @@ class JobManager:
             self.jobs.pop(job.id, None)
             job.deleted = True
         await asyncio.to_thread(self._cleanup_files, [j.id for j in expired])
+        await asyncio.to_thread(self._refresh_usage)
         if expired:
             logger.info("보관 기간이 지난 문서 작업 %d건 삭제", len(expired))
         return len(expired)
@@ -559,10 +667,10 @@ class JobManager:
             out = d / f"output{out_ext}"
             if not out.is_file():
                 raise DocumentError(MSG_FAILED)
-            await asyncio.to_thread((d / "preview.txt").write_text, result.preview[:20_000], "utf-8")
+            await asyncio.to_thread(_write_private, d / "preview.txt", result.preview[:20_000])
             items = await self._report(job, topts, result.pairs)
-            await asyncio.to_thread((d / "report.json").write_text,
-                                    json.dumps({"items": items}, ensure_ascii=False), "utf-8")
+            await asyncio.to_thread(_write_private, d / "report.json",
+                                    json.dumps({"items": items}, ensure_ascii=False))
             job.report_count = len(items)
             job.output_file = out.name
             source = opts.source_lang if opts.source_lang != "auto" else (job.detected_source_lang or "auto")
@@ -574,30 +682,31 @@ class JobManager:
             logger.info("문서 번역 완료 job=%s 형식=%s 단위=%d 글자=%d 검수=%d %.1f초", job.id, job.ext,
                         job.total, job.text_chars, job.report_count, time.monotonic() - started)
         except TranslationCancelled:
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "canceled", None)
             logger.info("문서 번역 취소 job=%s", job.id)
         except DocumentError as exc:
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "error", exc.message)
             logger.info("문서 번역 실패 job=%s 형식=%s: 입력 문제", job.id, job.ext)
         except VisionUnavailable:
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "error", MSG_VISION_UNAVAILABLE)
             logger.warning("문서 번역 실패 job=%s: 이미지 입력 미지원 모델", job.id)
         except LLMUnavailable:
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "error", MSG_LLM_UNAVAILABLE)
             logger.warning("문서 번역 실패 job=%s: 모델 서버 연결 안 됨", job.id)
         except LLMError as exc:
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "error", str(exc) or MSG_FAILED)
             logger.warning("문서 번역 실패 job=%s: 모델 오류 %s", job.id, type(exc).__name__)
         except asyncio.CancelledError:
+            self._discard_files(d)
             self._finish(job, "error", MSG_INTERRUPTED)
             raise
         except Exception as exc:  # noqa: BLE001 - any parser error ends the job, not the worker
-            self._remove_outputs(d)
+            self._discard_files(d)
             self._finish(job, "error", MSG_FAILED)
             # frames only: exception messages may quote document content
             logger.warning("문서 번역 실패 job=%s 형식=%s: %s\n%s", job.id, job.ext, type(exc).__name__,
@@ -606,12 +715,19 @@ class JobManager:
             self._running.discard(job.id)
             if job.deleted:
                 await asyncio.to_thread(shutil.rmtree, d, True)
+            else:
+                if job.status != "done":                 # files a handler thread wrote late
+                    await asyncio.to_thread(self._discard_files, d)
+                await asyncio.to_thread(_restrict_files, d)
+            await asyncio.to_thread(self._refresh_usage)
 
     @staticmethod
-    def _remove_outputs(d: Path) -> None:
-        for p in d.glob("output*"):
-            with contextlib.suppress(OSError):
-                p.unlink()
+    def _discard_files(d: Path) -> None:
+        """A failed / canceled job keeps only its record: the upload and partial results go."""
+        for pattern in ("input*", "output*", "preview.txt", "report.json"):
+            for p in d.glob(pattern):
+                with contextlib.suppress(OSError):
+                    p.unlink()
 
     # ------------------------------------------------------------ handler callbacks
     def _finish(self, job: Job, status: str, error: str | None) -> None:
@@ -631,8 +747,9 @@ class JobManager:
         self._persist(job, force=True)
 
     def _add_units(self, job: Job, units: int, chars: int) -> None:
-        job.total += max(0, units)
-        job.chars_total += max(0, chars)
+        """Negative values release work reserved earlier (never below what is done)."""
+        job.total = max(job.done, job.total + units)
+        job.chars_total = max(job.chars_done, job.chars_total + chars)
         self._persist(job)
 
     def _unit_done(self, job: Job, units: int, chars: int) -> None:
@@ -764,7 +881,7 @@ class JobManager:
         tmp = d / "meta.json.tmp"
         data = json.dumps(job.to_meta(), ensure_ascii=False, indent=1)
         try:
-            tmp.write_text(data, "utf-8")
+            _write_private(tmp, data)
             os.replace(tmp, d / "meta.json")
         except OSError:
             logger.warning("작업 기록을 저장하지 못했습니다 job=%s", job.id)

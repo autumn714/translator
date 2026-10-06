@@ -12,8 +12,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterable
+from decimal import Decimal, InvalidOperation
 
-from translator_app.documents.base import has_letters, strip_tags, tags_ok
+from translator_app.documents.base import has_letters, plain_output, strip_tags, tags_ok
 
 MAX_ITEMS = 500
 MAX_TEXT = 500
@@ -26,8 +27,17 @@ _MAGNITUDE = re.compile(
 )
 _ORDINAL = re.compile(r"^(?:st|nd|rd|th|er|e|ème|º|ª)(?![A-Za-z])", re.I)
 _SCALED = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(만|억|조|천|万|萬|億|亿|兆|千|thousand|million|billion|trillion)", re.I
+    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?)\s*(만|억|조|천|万|萬|億|亿|兆|千|thousand|million|billion|trillion)",
+    re.I,
 )
+_GROUPED = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+# dates: the month may be spelled out in the translation ("March 15, 2024"), so
+# only the year and the day are checked
+_DATE_YMD = re.compile(
+    r"(?<![\d.,])((?:19|20)\d{2})\s*([./-])\s*(?:1[0-2]|0?[1-9])\s*\2\s*(3[01]|[12]\d|0?[1-9])(?!\d)\.?"
+)
+_DATE_YM = re.compile(r"(?<![\d.,])((?:19|20)\d{2})\s*[./-]\s*(?:1[0-2]|0[1-9])(?![\d.,]\d)")
+_MONTH = re.compile(r"(?<![\d.,])(?:1[0-2]|0?[1-9])\s*(?:월|月)")
 _SCALE = {"천": 10**3, "千": 10**3, "thousand": 10**3, "만": 10**4, "万": 10**4, "萬": 10**4,
           "million": 10**6, "억": 10**8, "億": 10**8, "亿": 10**8, "billion": 10**9,
           "조": 10**12, "兆": 10**12, "trillion": 10**12}
@@ -36,6 +46,12 @@ _KANA = re.compile(r"[\u3040-\u30ff]")
 _HAN = re.compile(r"[\u4e00-\u9fff]")
 _CYRILLIC = re.compile(r"[\u0400-\u04ff]")
 _LATIN = re.compile(r"[A-Za-z\u00c0-\u024f]")
+
+
+def _mask_dates(text: str) -> str:
+    text = _DATE_YMD.sub(r" \1 \3 ", text)
+    text = _DATE_YM.sub(r" \1 ", text)
+    return _MONTH.sub(" ", text)
 
 
 def _normalize_number(raw: str, sep: str | None) -> str:
@@ -67,17 +83,19 @@ def numbers(text: str, *, skip_magnitude: bool = False) -> set[str]:
 
 def _target_numbers(text: str) -> set[str]:
     found = numbers(text) | {_normalize_number(n, None) for n in re.findall(r"\d+", text)}
-    for m in _SCALED.finditer(text):                    # "300만" == 3,000,000
+    for m in _SCALED.finditer(text):                    # "300만" == 3,000,000 ; "3,500만" == 35,000,000
+        raw = m.group(1)
+        raw = raw.replace(",", "") if _GROUPED.fullmatch(raw) else raw.replace(",", ".")
         try:
-            value = float(m.group(1).replace(",", ".")) * _SCALE[m.group(2).lower()]
-        except (KeyError, ValueError):
+            value = Decimal(raw) * _SCALE[m.group(2).lower()]
+        except (KeyError, InvalidOperation):
             continue
-        found.add(_normalize_number(f"{value:.6f}", None))
+        found.add(_normalize_number(format(value, "f"), None))
     return found
 
 
 def missing_numbers(src: str, tgt: str) -> list[str]:
-    src_nums = numbers(src, skip_magnitude=True)
+    src_nums = numbers(_mask_dates(src), skip_magnitude=True)
     if not src_nums:
         return []
     tgt_nums = _target_numbers(tgt)
@@ -162,7 +180,7 @@ def build_report(
         if (src, tgt) in seen:
             continue
         seen.add((src, tgt))
-        s, t = strip_tags(src).strip(), strip_tags(tgt).strip()
+        s, t = strip_tags(src).strip(), plain_output(src, tgt).strip()
         if not s or not has_letters(s):
             continue
         issues: list[str] = []
