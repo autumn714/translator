@@ -2,214 +2,283 @@
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>번역기</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d5bd6'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round' transform='translate(5 5) scale(.92)'%3E%3Cpath d='m5 8 6 6'/%3E%3Cpath d='m4 14 6-6 2-3'/%3E%3Cpath d='M2 5h12'/%3E%3Cpath d='M7 2h1'/%3E%3Cpath d='m22 22-5-10-5 10'/%3E%3Cpath d='M14 18h6'/%3E%3C/g%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
-  <body>
-    <main class="shell">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">Korea Energy Economics Institute</p>
-          <h1>
-            <button id="titleResetButton" class="title-reset-button" type="button">번역기</button>
-          </h1>
-          <p class="lede">
-            입력 언어를 자동으로 감지하고, 번역 결과 언어만 선택합니다. 입력이 잠시 멈추면 자동으로 번역됩니다.<br />
-            선택된 용어집의 해당 언어 방향 항목만 번역에 적용됩니다.
-          </p>
-        </div>
-        <div class="meta">
-          <span id="engineBadge" class="badge">engine: loading</span>
-          <span id="statusBadge" class="badge muted">대기 중</span>
-        </div>
-      </section>
+  <body data-tab="text">
+    <a class="skip-link" href="#main">본문으로 건너뛰기</a>
 
-      <section class="toolbar panel">
-        <div class="toolbar-row">
-          <div class="toolbar-spacer" aria-hidden="true"></div>
-          <div class="swap-group">
-            <button
-              id="swapButton"
-              class="swap-button"
-              type="button"
-              title="최근 번역 결과를 기준으로 입력과 결과를 전환합니다."
-              aria-label="입출력 전환"
-            >
-              <span class="swap-button-icon" aria-hidden="true">⇄</span>
-            </button>
-          </div>
-          <div class="language-group language-group-right">
-            <label class="select-label" for="targetLanguage">번역 언어</label>
-            <select id="targetLanguage" class="select-box"></select>
-          </div>
-        </div>
-      </section>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="번역기 처음으로">
+          <span class="brand-mark" aria-hidden="true"><i data-icon="languages" data-size="18"></i></span>
+          <span class="brand-name">번역기</span>
+          <span class="brand-org">KEEI</span>
+        </a>
 
-      <section class="grid">
-        <article id="sourcePanel" class="panel translation-panel">
-          <div class="panel-header">
-            <label for="sourceText" id="sourcePanelTitle" class="panel-title">원문 입력</label>
-            <span id="sourceCount" class="tiny">0자</span>
-          </div>
-          <textarea
-            id="sourceText"
-            spellcheck="false"
-            placeholder="텍스트를 입력하면 자동으로 번역됩니다."
-          ></textarea>
-        </article>
+        <nav class="tabs" role="tablist" aria-label="기능">
+          <button class="tab" role="tab" id="tab-text" type="button" aria-controls="panel-text" aria-selected="true">
+            <i data-icon="type"></i><span>텍스트 번역</span>
+          </button>
+          <button class="tab" role="tab" id="tab-docs" type="button" aria-controls="panel-docs" aria-selected="false" tabindex="-1">
+            <i data-icon="fileText"></i><span>문서 번역</span><span id="docsBadge" class="tab-badge" hidden></span>
+          </button>
+          <button class="tab" role="tab" id="tab-write" type="button" aria-controls="panel-write" aria-selected="false" tabindex="-1">
+            <i data-icon="pen"></i><span>글 다듬기</span>
+          </button>
+        </nav>
 
-        <article id="targetPanel" class="panel translation-panel">
-          <div class="panel-header">
-            <div class="output-header-group">
-              <span id="targetPanelTitle" class="panel-title">한국어 번역</span>
-              <div id="translationActivity" class="translation-activity" hidden>
-                <span class="translation-activity-dot" aria-hidden="true"></span>
-                <span id="translationActivityText">번역 중</span>
-              </div>
-            </div>
-            <span id="latencyText" class="tiny">-</span>
-          </div>
-          <div id="translationText" class="output empty">번역 결과가 여기에 표시됩니다.</div>
-        </article>
-      </section>
-
-      <section class="segments">
-        <div class="panel-header">
-          <div>
-            <span class="panel-title">구간별 보기</span>
-            <p class="tiny segment-copy">번역 처리 단위에 맞춰 원문과 번역문을 비교할 수 있습니다.</p>
-          </div>
-          <button id="toggleSegments" class="action-button secondary" type="button" aria-expanded="false">
-            열기
+        <div class="topbar-actions">
+          <button id="statusChip" class="status-chip tip tip-below tip-end" type="button" data-state="loading" aria-haspopup="dialog" data-tip="확인 중">
+            <span class="status-dot" aria-hidden="true"></span><span class="status-label">확인 중</span>
+          </button>
+          <button id="historyBtn" class="icon-btn tip tip-below" type="button" aria-label="번역 기록" data-tip="번역 기록">
+            <i data-icon="history"></i>
+          </button>
+          <button id="glossaryBtn" class="btn btn-ghost btn-sm topbar-btn" type="button" aria-label="용어집 관리">
+            <i data-icon="book"></i><span class="topbar-btn-label">용어집</span>
+          </button>
+          <button id="logoutBtn" class="icon-btn tip tip-below tip-end" type="button" aria-label="로그아웃" data-tip="로그아웃" hidden>
+            <i data-icon="logout"></i>
           </button>
         </div>
-        <div id="segmentsBody" class="segments-body" hidden>
-          <div id="segmentList" class="segment-list"></div>
-        </div>
-      </section>
+      </div>
+    </header>
 
-      <section class="glossary panel">
-        <div class="panel-header glossary-header">
-          <div>
-            <span class="panel-title">용어집</span>
-            <p class="tiny glossary-copy">
-              하나의 용어집에 여러 언어 방향의 항목을 함께 저장할 수 있습니다.<br />
-              현재 선택된 번역 언어에 맞는 항목만 번역에 적용됩니다.
-            </p>
-          </div>
-          <div class="glossary-actions">
-            <label class="switch">
-              <input id="useGlossary" type="checkbox" checked />
-              <span>용어집 사용</span>
+    <main id="main" class="page">
+      <!-- 텍스트 번역 -->
+      <section id="panel-text" class="tabpanel" role="tabpanel" aria-labelledby="tab-text">
+        <div class="optbar">
+          <label class="opt">
+            <span class="opt-label">어조</span>
+            <select id="formality" class="select select-bare"></select>
+          </label>
+          <div class="opt opt-gloss" id="glossOpt">
+            <span class="opt-label" id="glossLabel">용어집</span>
+            <select id="glossSel" class="select select-bare" aria-labelledby="glossLabel"></select>
+            <label class="switch switch-sm tip" data-tip="용어집 적용">
+              <input id="glossToggle" type="checkbox" role="switch" aria-label="용어집 적용" />
+              <span class="switch-ui" aria-hidden="true"></span>
             </label>
-            <select id="glossarySelect" class="select-box glossary-select"></select>
-            <button id="newGlossaryButton" class="action-button secondary" type="button">새 용어집</button>
-            <button id="deleteGlossaryButton" class="action-button danger" type="button">용어집 삭제</button>
-            <button id="addGlossaryRow" class="action-button secondary" type="button">행 추가</button>
-            <button id="saveGlossary" class="action-button" type="button">현재 용어집 저장</button>
           </div>
+          <button id="ctxToggle" class="opt opt-btn" type="button" aria-expanded="false" aria-controls="ctxPanel">
+            <i data-icon="sliders" data-size="16"></i><span>맥락 · 스타일 규칙</span><span class="opt-dot" aria-label="설정됨" hidden></span
+            ><i data-icon="chevronDown" data-size="16" class="opt-caret"></i>
+          </button>
         </div>
 
-        <div id="glossaryMeta" class="tiny glossary-meta"></div>
-
-        <div class="glossary-table-wrap">
-          <table class="glossary-table">
-            <thead>
-              <tr>
-                <th>사용</th>
-                <th>원문 언어</th>
-                <th>번역 언어</th>
-                <th>원문 용어</th>
-                <th>번역 용어</th>
-                <th>메모</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="glossaryTableBody"></tbody>
-          </table>
-        </div>
-        <div id="glossaryNotice" class="tiny glossary-notice">용어집을 불러오는 중입니다.</div>
-        <div id="glossaryHits" class="glossary-hits"></div>
-      </section>
-    </main>
-
-    <dialog id="glossaryModal" class="glossary-dialog">
-      <form id="glossaryModalForm" method="dialog" class="glossary-dialog-card">
-        <div class="panel-header modal-header">
-          <div>
-            <span class="panel-title">새 용어집 만들기</span>
-            <p class="tiny glossary-copy">이름을 정한 뒤 필요한 언어별 항목을 바로 입력할 수 있습니다.</p>
-          </div>
-          <button id="closeGlossaryModal" class="icon-button neutral" type="button">닫기</button>
-        </div>
-
-        <div class="modal-grid single">
+        <div id="ctxPanel" class="ctx-panel card" hidden>
           <label class="field">
-            <span class="select-label">용어집 이름</span>
-            <input
-              id="newGlossaryName"
-              class="text-input"
-              type="text"
-              maxlength="120"
-              placeholder="예: 수소 에너지 정책 용어집"
-            />
+            <span class="field-head"><span class="field-label">맥락</span><span class="field-count" id="ctxCount">0 / 4,000</span></span>
+            <textarea id="ctxText" class="input" rows="3" maxlength="4000" placeholder="문서 종류, 독자, 배경 정보"></textarea>
+          </label>
+          <label class="field">
+            <span class="field-head"><span class="field-label">스타일 규칙</span><span class="field-count" id="rulesCount">0 / 2,000</span></span>
+            <textarea id="rulesText" class="input" rows="3" maxlength="2000" placeholder="예: 기관명은 영문 약어 병기, 숫자는 아라비아 숫자"></textarea>
           </label>
         </div>
 
-        <div class="glossary-table-wrap modal-table-wrap">
-          <table class="glossary-table">
-            <thead>
-              <tr>
-                <th>사용</th>
-                <th>원문 언어</th>
-                <th>번역 언어</th>
-                <th>원문 용어</th>
-                <th>번역 용어</th>
-                <th>메모</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="newGlossaryTableBody"></tbody>
-          </table>
-        </div>
-
-        <div class="modal-actions">
-          <span id="glossaryModalNotice" class="tiny"></span>
-          <div class="modal-button-row">
-            <button id="addNewGlossaryRow" class="action-button secondary" type="button">행 추가</button>
-            <button id="createGlossaryButton" class="action-button" type="submit">용어집 생성</button>
+        <div class="card xcard" id="textCard">
+          <div class="langbar">
+            <div class="langbar-side">
+              <select id="srcLang" class="select select-lang" aria-label="원문 언어"></select>
+            </div>
+            <button id="swapBtn" class="swap-btn tip tip-below" type="button" aria-label="언어 바꾸기" data-tip="언어 바꾸기 · Ctrl+Shift+S">
+              <i data-icon="swap"></i>
+            </button>
+            <div class="langbar-side langbar-tgt">
+              <select id="tgtLang" class="select select-lang" aria-label="번역 언어"></select>
+            </div>
+          </div>
+          <div class="panes">
+            <div class="pane pane-src">
+              <textarea id="srcText" class="src-text" spellcheck="false" placeholder="번역할 내용을 입력하세요" aria-label="원문"></textarea>
+              <button id="clearBtn" class="icon-btn clear-btn tip" type="button" aria-label="지우기" data-tip="지우기" hidden>
+                <i data-icon="x"></i>
+              </button>
+              <div class="pane-foot">
+                <span id="srcCount" class="counter">0 / 30,000</span>
+              </div>
+            </div>
+            <div class="pane pane-out">
+              <div class="busy-line" id="busyLine" hidden></div>
+              <div id="outText" class="out-text" role="textbox" aria-multiline="true" aria-label="번역 결과" aria-readonly="true" spellcheck="false"></div>
+              <div id="outPlaceholder" class="out-placeholder" aria-hidden="true">번역</div>
+              <div class="pane-foot out-foot" id="outFoot" hidden>
+                <div class="foot-left">
+                  <button id="hitsChip" class="mini-chip" type="button" hidden>
+                    <i data-icon="book" data-size="14"></i><span class="chip-text"></span>
+                  </button>
+                  <button id="identityChip" class="mini-chip mini-chip-accent" type="button" hidden>
+                    <i data-icon="swap" data-size="14"></i><span class="chip-text"></span>
+                  </button>
+                </div>
+                <div class="foot-right">
+                  <button id="segBtn" class="icon-btn tip" type="button" aria-pressed="false" aria-label="구간별 보기" data-tip="구간별 보기">
+                    <i data-icon="columns"></i>
+                  </button>
+                  <button id="speakBtn" class="icon-btn tip" type="button" aria-pressed="false" aria-label="듣기" data-tip="듣기">
+                    <i data-icon="volume"></i>
+                  </button>
+                  <button id="copyBtn" class="icon-btn tip" type="button" aria-label="복사" data-tip="복사 · Ctrl+Shift+C">
+                    <i data-icon="copy"></i>
+                  </button>
+                  <button id="saveBtn" class="icon-btn tip tip-end" type="button" aria-label="TXT로 저장" data-tip="TXT로 저장">
+                    <i data-icon="download"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-      </form>
-    </dialog>
 
-    <dialog id="swapModal" class="glossary-dialog">
-      <form id="swapModalForm" method="dialog" class="glossary-dialog-card swap-dialog-card">
-        <div class="panel-header modal-header">
-          <div>
-            <span class="panel-title">입출력 전환</span>
-            <p id="swapModalCopy" class="tiny glossary-copy">
-              자동 전환 기준을 충족하지 않으면 감지된 원문 언어 중에서 직접 선택할 수 있습니다.
-            </p>
+        <section id="segPanel" class="card seg-panel" aria-labelledby="segTitle" hidden>
+          <div class="seg-head">
+            <h2 id="segTitle" class="section-title">구간별 보기</h2>
+            <span id="segCount" class="muted small"></span>
+            <span class="spacer"></span>
+            <button id="segClose" class="icon-btn icon-btn-sm" type="button" aria-label="구간별 보기 닫기"><i data-icon="x" data-size="16"></i></button>
           </div>
-          <button id="closeSwapModal" class="icon-button neutral" type="button">닫기</button>
+          <ol id="segList" class="seg-list"></ol>
+        </section>
+
+        <div class="drop-overlay" id="textDrop" hidden>
+          <div class="drop-overlay-inner"><i data-icon="upload" data-size="28"></i><span>문서 번역으로 올리기</span></div>
+        </div>
+      </section>
+
+      <!-- 문서 번역 -->
+      <section id="panel-docs" class="tabpanel" role="tabpanel" aria-labelledby="tab-docs" hidden>
+        <div class="card xcard doc-card">
+          <div class="langbar doc-langbar">
+            <div class="langbar-side">
+              <select id="docSrc" class="select select-lang" aria-label="원문 언어"></select>
+            </div>
+            <span class="langbar-arrow" aria-hidden="true"><i data-icon="arrowRight"></i></span>
+            <div class="langbar-side langbar-tgt">
+              <select id="docTgt" class="select select-lang" aria-label="번역 언어"></select>
+            </div>
+          </div>
+          <div class="doc-opts">
+            <label class="opt">
+              <span class="opt-label">어조</span>
+              <select id="docFormality" class="select select-bare"></select>
+            </label>
+            <label class="opt">
+              <span class="opt-label">용어집</span>
+              <select id="docGloss" class="select select-bare"></select>
+            </label>
+            <button id="docCtxToggle" class="opt opt-btn" type="button" aria-expanded="false" aria-controls="docCtx">
+              <i data-icon="sliders" data-size="16"></i><span>맥락</span><span class="opt-dot" aria-label="설정됨" hidden></span
+              ><i data-icon="chevronDown" data-size="16" class="opt-caret"></i>
+            </button>
+          </div>
+          <div id="docCtx" class="doc-ctx" hidden>
+            <textarea id="docCtxText" class="input" rows="2" maxlength="4000" placeholder="문서 종류, 독자, 배경 정보" aria-label="맥락"></textarea>
+          </div>
+
+          <div class="dropzone" id="dropzone">
+            <div class="dz-icon" aria-hidden="true"><i data-icon="upload" data-size="24"></i></div>
+            <div class="dz-text">
+              <div class="dz-title">파일을 끌어다 놓으세요</div>
+              <div class="dz-meta" id="dzMeta">최대 50MB · 24시간 후 자동 삭제</div>
+            </div>
+            <button id="pickBtn" class="btn btn-primary" type="button"><i data-icon="file" data-size="16"></i>파일 선택</button>
+            <input id="fileInput" type="file" multiple hidden />
+            <div class="fmt-chips" id="fmtChips" aria-label="지원 형식"></div>
+          </div>
+
+          <div class="staging" id="staging" hidden>
+            <ul class="staged-list" id="stagedList"></ul>
+            <div class="staging-bar">
+              <div class="staging-opts">
+                <div class="opt-field tip" id="outputField" data-tip="원문+번역: DOCX · HWPX · TXT · MD">
+                  <span class="opt-label">출력</span>
+                  <div class="seg" role="radiogroup" aria-label="출력 형식" id="outputSeg">
+                    <button type="button" role="radio" data-value="translated">번역본</button>
+                    <button type="button" role="radio" data-value="bilingual">원문+번역</button>
+                  </div>
+                </div>
+                <div class="opt-field" id="pdfField" hidden>
+                  <span class="opt-label">PDF</span>
+                  <div class="seg" role="radiogroup" aria-label="PDF 처리 방식" id="pdfSeg">
+                    <button type="button" role="radio" data-value="layout">레이아웃 유지</button>
+                    <button type="button" role="radio" data-value="docx">Word로 받기</button>
+                  </div>
+                </div>
+              </div>
+              <div class="staging-actions">
+                <button id="stageClear" class="btn btn-ghost" type="button">취소</button>
+                <button id="startBtn" class="btn btn-primary" type="button"><i data-icon="languages" data-size="16"></i><span class="btn-text">번역 시작</span></button>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="swap-candidate-block">
-          <span class="select-label">감지된 원문 언어</span>
-          <div id="swapDetectedLanguages" class="swap-detected-languages"></div>
-        </div>
+        <section class="jobs" id="jobsSection" aria-labelledby="jobsTitle" hidden>
+          <div class="jobs-head">
+            <h2 id="jobsTitle" class="section-title">작업</h2>
+            <span class="muted small" id="jobsMeta"></span>
+          </div>
+          <ul id="jobList" class="job-list"></ul>
+        </section>
+      </section>
 
-        <div class="modal-actions">
-          <span id="swapModalNotice" class="tiny"></span>
+      <!-- 글 다듬기 -->
+      <section id="panel-write" class="tabpanel" role="tabpanel" aria-labelledby="tab-write" hidden>
+        <div class="card xcard">
+          <div class="langbar wbar">
+            <select id="wLang" class="select select-lang" aria-label="언어"></select>
+            <span class="wbar-sep" aria-hidden="true"></span>
+            <div class="chips" id="wStyles" role="radiogroup" aria-label="문체"></div>
+          </div>
+          <div class="panes">
+            <div class="pane pane-src">
+              <textarea id="wInput" class="src-text" spellcheck="false" placeholder="다듬을 글을 입력하세요" aria-label="다듬을 글"></textarea>
+              <button id="wClear" class="icon-btn clear-btn tip" type="button" aria-label="지우기" data-tip="지우기" hidden>
+                <i data-icon="x"></i>
+              </button>
+              <div class="pane-foot">
+                <span id="wCount" class="counter">0 / 10,000</span>
+                <span class="spacer"></span>
+                <button id="wRun" class="btn btn-primary btn-sm tip tip-end" type="button" data-tip="Ctrl+Enter" disabled>
+                  <i data-icon="sparkles" data-size="16"></i><span>다듬기</span>
+                </button>
+              </div>
+            </div>
+            <div class="pane pane-out">
+              <div class="busy-line" id="wBusy" hidden></div>
+              <div id="wOut" class="out-text diff-text" aria-label="다듬은 글" aria-live="polite"></div>
+              <div id="wPlaceholder" class="out-placeholder" aria-hidden="true">다듬은 글</div>
+              <div class="pane-foot out-foot" id="wFoot" hidden>
+                <div class="foot-left">
+                  <label class="switch switch-sm">
+                    <input id="wShowDiff" type="checkbox" role="switch" checked />
+                    <span class="switch-ui" aria-hidden="true"></span>
+                    <span class="switch-text">변경 표시</span>
+                  </label>
+                  <span id="wChanges" class="muted small"></span>
+                </div>
+                <div class="foot-right">
+                  <button id="wCopy" class="icon-btn tip" type="button" aria-label="복사" data-tip="복사"><i data-icon="copy"></i></button>
+                  <button id="wApply" class="btn btn-sm" type="button"><i data-icon="arrowLeft" data-size="16"></i>입력에 적용</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
-      </form>
-    </dialog>
+      </section>
+    </main>
 
     <script>
       window.TRANSLATOR_LANGUAGES = __TRANSLATOR_LANGUAGES__;
     </script>
-    <script src="/static/app.js" type="module"></script>
+    <script type="module" src="/static/app.js"></script>
   </body>
 </html>
