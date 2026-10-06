@@ -33,6 +33,7 @@ const KEYS = {
   tgt: "translator.targetLang",
   formality: "translator.formality",
   rules: "translator.instructions",
+  lastSource: "translator.lastDetectedSource",
 };
 const CONTEXT_MAX = 4000;
 const RULES_MAX = 2000;
@@ -408,7 +409,27 @@ function pinnedFor(source) {
   return null;
 }
 
+// DeepL 방식: 자동 감지한 원문 언어가 번역 언어와 같으면 번역 언어를 바꿔 다시 번역한다.
+// 바꿀 언어는 마지막으로 감지된 다른 원문 언어, 없으면 한국어 ↔ 영어.
+function autoSwitchTarget(event) {
+  const primary = event.primary_source_lang;
+  if (el.srcLang.value !== "auto" || event.source_language_mode !== "single" || !isLanguage(primary)) return false;
+  if (primary !== el.tgtLang.value) {
+    store.set(KEYS.lastSource, primary);
+    return false;
+  }
+  const remembered = store.get(KEYS.lastSource, null);
+  const next = isLanguage(remembered) && remembered !== primary ? remembered : primary === "ko" ? "en" : "ko";
+  setSelectValue(el.tgtLang, next);
+  store.set(KEYS.tgt, next);
+  refreshFormality();
+  abortStream();
+  schedule(0);
+  return true;
+}
+
 function onStart(event) {
+  if (autoSwitchTarget(event)) return;
   const current = S.current;
   current.started = true;
   S.detected = {

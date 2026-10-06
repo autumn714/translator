@@ -641,12 +641,12 @@ __t.mocks.push((url) => {
   await __t.translated("두 번째");
   await __t.until(() => items().includes(b));
   const first = items();
-  __t.typeSource("Hello wor");
-  await __t.translated("Hello wor");
-  await __t.until(() => items().includes("Hello wor"));
-  __t.typeSource("Hello world, again.");
-  await __t.translated("again.");
-  await __t.until(() => items().includes("Hello world, again."));
+  __t.typeSource("회의 결과를 공");
+  await __t.translated("회의 결과를 공");
+  await __t.until(() => items().includes("회의 결과를 공"));
+  __t.typeSource("회의 결과를 공유드립니다.");
+  await __t.translated("공유드립니다.");
+  await __t.until(() => items().includes("회의 결과를 공유드립니다."));
   return { first, second: items() };
 }""",
         },
@@ -767,6 +767,22 @@ __t.mocks.push((url, method) => {{
   await __t.translated("Hello there.");
   await __t.until(() => live && live.textContent === "번역 완료", 2000);
   return { attrs, text: live.textContent };
+}""",
+        },
+        {
+            "name": "auto_switch_same_language",
+            "init": "localStorage.setItem('translator.targetLang', JSON.stringify('ko')); localStorage.removeItem('translator.lastDetectedSource');",
+            "run": r"""async () => {
+  const target = document.querySelector("#tgtLang");
+  __t.typeSource("수소 생산 설비의 탄소 배출 강도는 인증 기준 이하여야 합니다.");
+  await __t.until(() => target.value === "en", 5000);
+  await __t.translated("인증 기준");
+  const afterKorean = target.value;
+  __t.typeSource("The certification review checks the emission intensity of every hydrogen production facility.");
+  await __t.until(() => target.value === "ko", 5000);
+  await __t.translated("production facility.");
+  const afterEnglish = target.value;
+  return { afterKorean, afterEnglish, stored: JSON.parse(localStorage.getItem("translator.targetLang")) };
 }""",
         },
     ]
@@ -980,7 +996,7 @@ def test_history_keeps_texts_with_same_opening(ui) -> None:
     a = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 첫 번째 문서는 회의 자료입니다."
     b = "안녕하십니까. 한국에너지경제연구원 지식정보화실입니다. 두 번째 자료를 보내드립니다."
     assert result["first"] == [b, a]
-    assert result["second"] == ["Hello world, again.", b, a]  # typing on merges into one record
+    assert result["second"] == ["회의 결과를 공유드립니다.", b, a]  # typing on merges into one record
 
 
 def test_history_merges_edits_in_the_middle(ui) -> None:
@@ -1018,3 +1034,12 @@ def test_translation_result_is_announced(ui) -> None:
     result = value(ui, "output_live_region")
     assert result["attrs"] == {"role": "status", "live": "polite"}
     assert result["text"] == "번역 완료"
+
+
+def test_same_language_input_switches_target_like_deepl(ui) -> None:
+    result = value(ui, "auto_switch_same_language")
+    # Korean typed with target Korean -> target becomes English; English typed with target English
+    # -> target switches back to the last other detected source language (Korean).
+    assert result["afterKorean"] == "en"
+    assert result["afterEnglish"] == "ko"
+    assert result["stored"] == "ko"
