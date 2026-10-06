@@ -38,6 +38,7 @@ DOC_LINES = [
     "Check the pressure gauge before every use.",
 ]
 TERMINAL = {"done", "error", "canceled"}
+FAKE_KO = "[KO] "   # dev/fake_vllm.py 의 가짜 한국어 번역 표시
 
 
 # ------------------------------------------------------------------ HTTP
@@ -220,8 +221,16 @@ def check_pdf(data: bytes) -> str | None:
     except ImportError:
         return None
     with pymupdf.open(stream=data, filetype="pdf") as doc:
-        text = "".join(page.get_text() for page in doc)
-    return None if DOC_LINES[1] not in text else "번역본에 원문 문장이 그대로 있음"
+        text = " ".join(" ".join(page.get_text().split()) for page in doc)
+    # 시험용 가짜 모델(dev/fake_vllm.py)은 "[KO] 원문" 으로 답한다. 이 표시가 붙은 문장은 번역된 것으로 본다
+    rest = text
+    for line in DOC_LINES:
+        rest = rest.replace(FAKE_KO + line, "")
+    if any(line in rest for line in DOC_LINES):
+        return "번역본에 원문 문장이 그대로 있음"
+    if FAKE_KO not in text and not any("가" <= ch <= "힣" for ch in text):
+        return "번역본에 한국어가 없음"
+    return None
 
 
 def check_txt(data: bytes) -> str | None:
