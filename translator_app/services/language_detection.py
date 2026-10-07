@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import re
+import threading
 from typing import Literal
 
 from translator_app.languages import LANGUAGE_MAP
@@ -18,6 +19,61 @@ except Exception:  # pragma: no cover - fallback path when dependency is unavail
 LanguageMode = Literal["single", "mixed", "unknown"]
 
 _UNIT_PATTERN = re.compile(r"\n{2,}|(?<=[.!?。！？])\s+")
+
+# Frequent characters written differently in Traditional and Simplified Chinese (each set holds only
+# characters that the other script does not use), to tell zh-Hant from zh-Hans for Han-only text.
+_TRADITIONAL_ONLY = frozenset(
+    "這個們來時會說對為國學與點發現經進過還開問關認實當從動樣種義長電無車書東門見頭萬語業產務網際華機將氣處變應該"
+    "總聯廣師歷錢買賣讓雙請議題號風飛馬魚鳥麗黃齊龍區員圖報場壓濟熱爾環結給統續練線組細終級紅約紀術規視計記設許試"
+    "話調論識證讀負貨質費資選運達適邊釋錄鐵間陽隊離難響項須領類顯飯驗價優傳億兒創勞勢單廠參嗎園團備媽寫導層屬島帶"
+    "幫庫張歸態戰擇數斷條極構標樂權歡測滿漢燈營獨獲畫療確穩競筆節簡糧純紙絕維綠緊縣織職聽腦興舉舊藝蘭衛裝親觀覺訂"
+    "訊詞詳誤課談謝講護贊貝財責貴貿賽趙軍軟較載輕輸轉農連遠遺鄉醫針鋼錯鍵閱隨險雜雖雞韓頁順預頻額顧養館氫換"
+    "製後裡臺範復複據劃異豐願週遊內體麼"
+)
+_SIMPLIFIED_ONLY = frozenset(
+    "这个们来时会说对为国学与点发现经进过还开问关认实当从动样种义长电无车书东门见头万语业产务网际华机将气处变应该"
+    "总联广师历钱买卖让双请议题号风飞马鱼鸟丽黄齐龙区员图报场压济热尔环结给统续练线组细终级红约纪术规视计记设许试"
+    "话调论识证读负货质费资选运达适边释录铁间阳队离难响项须领类显饭验价优传亿儿创劳势单厂参吗园团备妈写导层属岛带"
+    "帮库张归态战择数断条极构标乐权欢测满汉灯营独获画疗确稳竞笔节简粮纯纸绝维绿紧县织职听脑兴举旧艺兰卫装亲观觉订"
+    "讯词详误课谈谢讲护赞贝财责贵贸赛赵军软较载轻输转农连远遗乡医针钢错键阅随险杂虽鸡韩页顺预频额顾养馆氢换"
+)
+
+_FACTORY_LOCK = threading.Lock()
+_factory_ready = False
+
+
+def chinese_script_counts(text: str) -> tuple[int, int]:
+    """(Traditional-only, Simplified-only) character counts."""
+    traditional = simplified = 0
+    for char in text:
+        if char in _TRADITIONAL_ONLY:
+            traditional += 1
+        elif char in _SIMPLIFIED_ONLY:
+            simplified += 1
+    return traditional, simplified
+
+
+def _chinese_code(text: str) -> str:
+    traditional, simplified = chinese_script_counts(text)
+    return "zh-Hant" if traditional > simplified else "zh-Hans"
+
+
+def _ensure_langdetect_ready() -> None:
+    """Load langdetect's profiles once under a lock: detection runs in worker threads, and two first
+    calls at the same time could otherwise use a half-loaded profile set."""
+    global _factory_ready
+    if _factory_ready:
+        return
+    with _FACTORY_LOCK:
+        if _factory_ready:
+            return
+        try:
+            from langdetect import detector_factory
+
+            detector_factory.init_factory()
+        except Exception:  # noqa: BLE001 - detect_langs reports the problem per call
+            pass
+        _factory_ready = True
 
 
 @dataclass(slots=True)
@@ -57,6 +113,7 @@ def detect_source_languages(text: str) -> DetectionSummary:
 def _detect_with_langdetect(text: str) -> DetectionSummary | None:
     if detect_langs is None:
         return None
+    _ensure_langdetect_ready()
 
     counts = Counter[str]()
     direct_evidence = Counter[str]()
@@ -95,7 +152,7 @@ def _detect_with_langdetect(text: str) -> DetectionSummary | None:
             counts[normalized_code] += detectable_length * (probability / total_probability)
 
     if han_count:
-        assigned_code = _assign_han_characters(counts, han_count)
+        assigned_code = _assign_han_characters(counts, han_count, chinese=_chinese_code(text))
         direct_evidence[assigned_code] += han_count
 
     if not counts:
@@ -201,7 +258,7 @@ def _detect_with_script_fallback(text: str) -> DetectionSummary:
 
     direct_evidence = Counter(counts)
     if han_count:
-        assigned_code = _assign_han_characters(counts, han_count)
+        assigned_code = _assign_han_characters(counts, han_count, chinese=_chinese_code(text))
         direct_evidence[assigned_code] += han_count
 
     if not counts:
@@ -242,15 +299,15 @@ def _split_detection_unit(unit: str) -> tuple[Counter[str], float, str, int]:
     return counts, han_count, "".join(detectable_parts).strip(), detectable_length
 
 
-def _assign_han_characters(counts: Counter[str], han_count: float) -> str:
+def _assign_han_characters(counts: Counter[str], han_count: float, *, chinese: str = "zh-Hans") -> str:
     if counts["ja"] >= max(2, han_count / 8):
         counts["ja"] += han_count
         return "ja"
     if counts["ko"] and han_count <= max(2, counts["ko"] / 8):
         counts["ko"] += han_count
         return "ko"
-    counts["zh-Hans"] += han_count
-    return "zh-Hans"
+    counts[chinese] += han_count
+    return chinese
 
 
 def _is_ignored(char: str) -> bool:

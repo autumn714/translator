@@ -3,11 +3,21 @@ from __future__ import annotations
 from typing import TypedDict
 
 
-class LanguageSpec(TypedDict):
+class LanguageSpec(TypedDict, total=False):
     code: str
     label: str
     prompt_name: str
     favorite: bool
+    formality: list[str]
+
+
+# Register ("어조") choices per target language; the prompt wording lives in llm/prompts.py.
+# ko: formal=합니다체, informal=해요체, plain=한다체, gaejoshik=개조식 / ja: formal=です・ます, plain=だ・である
+FORMALITY_OPTIONS: dict[str, list[str]] = {
+    "ko": ["auto", "formal", "informal", "plain", "gaejoshik"],
+    "ja": ["auto", "formal", "plain"],
+}
+DEFAULT_FORMALITY_OPTIONS = ["auto", "formal", "informal"]
 
 
 LANGUAGES: list[LanguageSpec] = [
@@ -55,9 +65,27 @@ LANGUAGES: list[LanguageSpec] = [
     {"code": "vi", "label": "베트남어", "prompt_name": "Vietnamese", "favorite": False},
 ]
 
+for _spec in LANGUAGES:
+    _spec["formality"] = list(FORMALITY_OPTIONS.get(_spec["code"], DEFAULT_FORMALITY_OPTIONS))
+
 LANGUAGE_MAP = {item["code"]: item for item in LANGUAGES}
+# Languages written without spaces between sentences (units are joined with "").
+NO_SPACE_LANGUAGES = frozenset({"ja", "zh-Hans", "zh-Hant", "th"})
 FAVORITE_LANGUAGE_CODES = [item["code"] for item in LANGUAGES if item["favorite"]]
 
 
 def language_name(code: str) -> str:
     return LANGUAGE_MAP.get(code, {}).get("prompt_name", code)
+
+
+def language_label(code: str) -> str:
+    return LANGUAGE_MAP.get(code, {}).get("label", code)
+
+
+def is_known_language(code: str) -> bool:
+    return code in LANGUAGE_MAP
+
+
+def unit_joiner(target_lang: str) -> str:
+    """Separator between sentence chunks of one paragraph in the target language."""
+    return "" if target_lang in NO_SPACE_LANGUAGES else " "

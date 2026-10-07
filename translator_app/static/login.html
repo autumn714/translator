@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex" />
+    <title>로그인 · 번역기</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231d5bd6'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round' transform='translate(5 5) scale(.92)'%3E%3Cpath d='m5 8 6 6'/%3E%3Cpath d='m4 14 6-6 2-3'/%3E%3Cpath d='M2 5h12'/%3E%3Cpath d='M7 2h1'/%3E%3Cpath d='m22 22-5-10-5 10'/%3E%3Cpath d='M14 18h6'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="login-page">
+    <main>
+      <form id="loginForm" class="card login-card" novalidate>
+        <div class="login-brand brand" aria-label="번역기">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m5 8 6 6" /><path d="m4 14 6-6 2-3" /><path d="M2 5h12" /><path d="M7 2h1" /><path d="m22 22-5-10-5 10" /><path d="M14 18h6" />
+            </svg>
+          </span>
+          <span class="brand-name">번역기</span>
+          <span class="brand-org">KEEI</span>
+        </div>
+
+        <label class="field">
+          <span class="field-label">아이디</span>
+          <input id="username" name="username" class="input" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" required autofocus />
+        </label>
+        <label class="field">
+          <span class="field-label">비밀번호</span>
+          <input id="password" name="password" class="input" type="password" autocomplete="current-password" required />
+        </label>
+
+        <p id="loginError" class="form-error" role="alert" hidden></p>
+
+        <button id="loginBtn" class="btn btn-primary btn-block" type="submit">로그인</button>
+      </form>
+    </main>
+
+    <script>
+      (function () {
+        var form = document.getElementById("loginForm");
+        var user = document.getElementById("username");
+        var pass = document.getElementById("password");
+        var error = document.getElementById("loginError");
+        var button = document.getElementById("loginBtn");
+        var KEY = "translator.lastUser";
+
+        try {
+          var saved = window.localStorage.getItem(KEY);
+          if (saved) {
+            user.value = saved;
+            pass.focus();
+          }
+        } catch (e) {}
+
+        function showError(message) {
+          error.textContent = message;
+          error.hidden = false;
+        }
+
+        form.addEventListener("submit", function (event) {
+          event.preventDefault();
+          error.hidden = true;
+          if (!user.value.trim()) {
+            user.focus();
+            return showError("아이디를 입력하세요.");
+          }
+          if (!pass.value) {
+            pass.focus();
+            return showError("비밀번호를 입력하세요.");
+          }
+          button.disabled = true;
+          button.classList.add("is-loading");
+          fetch("/api/login", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ username: user.value.trim(), password: pass.value }),
+          })
+            .then(function (response) {
+              if (response.ok) {
+                try {
+                  window.localStorage.setItem(KEY, user.value.trim());
+                } catch (e) {}
+                window.location.replace("/");
+                return;
+              }
+              return response
+                .json()
+                .catch(function () {
+                  return {};
+                })
+                .then(function (data) {
+                  var detail = data && typeof data.detail === "string" ? data.detail : "";
+                  if (response.status === 401 || response.status === 403) detail = detail || "아이디 또는 비밀번호가 올바르지 않습니다.";
+                  if (response.status === 429) detail = detail || "시도가 많습니다. 잠시 후 다시 시도하세요.";
+                  showError(detail || "로그인하지 못했습니다.");
+                  pass.select();
+                  button.disabled = false;
+                  button.classList.remove("is-loading");
+                });
+            })
+            .catch(function () {
+              showError("서버에 연결할 수 없습니다.");
+              button.disabled = false;
+              button.classList.remove("is-loading");
+            });
+        });
+      })();
+    </script>
+  </body>
+</html>

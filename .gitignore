@@ -18,8 +18,14 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Runtime / cache (created by vLLM container on server)
-data/vllm-work/
+# 서버에서 실행하면 생기는 것 (bash run.sh ...) — 모두 프로젝트 폴더 안
+/cache/
+/logs/
+/state/
+/data/jobs/
 
 # Logs
 *.log
+
+# 프롬프트 기록(실적 증빙용, 공개 저장소 제외)
+prompts/

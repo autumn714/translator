@@ -1,0 +1,11 @@
+# 서버(리눅스)로 옮길 때 줄바꿈이 CRLF로 바뀌지 않게 한다
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
+*.hwp binary
+*.hwpx binary
+*.whl binary
