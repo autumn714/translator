@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from translator_app.auth import AuthMiddleware, LoginThrottle, SessionSigner, session_signing_key
@@ -165,6 +166,16 @@ class SameOriginGuard:
         await self.app(scope, receive, send)
 
 
+class RevalidatedStaticFiles(StaticFiles):
+    """Asset URLs carry no version, so browsers must revalidate them (ETag → 304); otherwise a
+    heuristically cached old styles.css / app.js can outlive a deploy until a hard refresh."""
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 def _load_documents(settings: Settings, translator: TranslatorService) -> tuple[Any, Any]:
     """Optional subsystem: text translation must work even if PyMuPDF / lxml are missing."""
     try:
@@ -245,7 +256,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def documents_unavailable() -> JSONResponse:
             return JSONResponse(status_code=503, content={"detail": MSG_DOCUMENTS_UNAVAILABLE})
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", RevalidatedStaticFiles(directory=STATIC_DIR), name="static")
 
     serialized_languages = json.dumps(LANGUAGES, ensure_ascii=False).replace("<", "\\u003c")
     index_path = STATIC_DIR / "index.html"

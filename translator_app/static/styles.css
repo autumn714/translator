@@ -1087,11 +1087,12 @@ textarea.input {
   overflow: hidden;
 }
 
+/* equal side columns keep the middle control centred on the pane divider below */
 .langbar {
-  position: relative;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
+  column-gap: 8px;
   min-height: 54px;
   padding: 7px 0;
   border-bottom: 1px solid var(--divider);
@@ -1101,25 +1102,16 @@ textarea.input {
 .langbar-side {
   display: flex;
   align-items: center;
-  gap: 8px;
   min-width: 0;
-  padding: 0 34px 0 13px;
+  padding-left: 13px;
 }
 
 .langbar-tgt {
-  padding-left: 18px;
+  padding: 0 13px 0 0;
 }
 
 .langbar-tgt .select-lang {
   padding-left: 8px;
-}
-
-.swap-btn,
-.langbar-arrow {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  translate: -50% -50%;
 }
 
 .swap-btn {
@@ -3142,25 +3134,19 @@ dialog {
     padding-left: 10px;
   }
   .langbar {
-    padding: 6px 0;
+    padding: 6px 4px;
     min-height: 50px;
   }
   .langbar-side {
-    padding: 0 26px 0 4px;
-  }
-  .langbar-tgt {
-    padding: 0 4px 0 26px;
+    padding: 0;
   }
   .select-lang {
     width: 100%;
     font-size: 14.5px;
     padding-left: 10px;
   }
-  .langbar-side {
-    justify-content: stretch;
-  }
   .langbar-tgt .select-lang {
-    text-align: left;
+    padding-left: 10px;
   }
   .wbar {
     flex-wrap: wrap;
@@ -3382,5 +3368,14 @@ dialog {
   }
   .opt-label {
     font-size: 12.5px;
+  }
+  /* glossary picker on its own row so the name is not cut short */
+  .gl-pick {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    row-gap: 10px;
+  }
+  .gl-picker {
+    flex-basis: 100%;
   }
 }

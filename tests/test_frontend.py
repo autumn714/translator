@@ -87,6 +87,10 @@ async function main() {
       const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
       await send("Page.enable", {}, sessionId);
       await send("Runtime.enable", {}, sessionId);
+      if (scenario.viewport) {
+        const [width, height, deviceScaleFactor = 1] = scenario.viewport;
+        await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor, mobile: false }, sessionId);
+      }
       await send("Page.addScriptToEvaluateOnNewDocument", { source: spec.prelude + "\n" + (scenario.init || "") }, sessionId);
       await send("Page.navigate", { url: spec.base + (scenario.path || "/") }, sessionId);
       let ready = false;
@@ -221,6 +225,78 @@ window.__job = (id, status, extra = {}) => ({
   expires_at: "2099-01-01T00:00:00Z", eta_seconds: null, chars: 10, report_count: 0, ...extra,
 });
 """
+
+# (width, height, device pixel ratio); 1536 × 1.25 is a 1920 px screen at 125 % scaling.
+LANGBAR_VIEWPORTS = [(1536, 730, 1.25), (1280, 800, 1), (820, 900, 1), (390, 844, 1)]
+
+# Long labels in both language bars; measures the selects against the swap button / arrow between them.
+LANGBAR_RUN = r"""async () => {
+  const q = (selector) => document.querySelector(selector);
+  const box = (node) => node.getBoundingClientRect();
+  const midY = (rect) => (rect.top + rect.bottom) / 2;
+  const hits = (node, x, y) => node.contains(document.elementFromPoint(x, y));
+  const setAutoLabel = (select, text) => { select.querySelector('option[data-auto="1"]').textContent = text; };
+  const rows = [];
+  const measure = (tab, bar, src, mid, tgt, centerX) => {
+    tgt.focus();
+    const b = box(bar), s = box(src), m = box(mid), t = box(tgt);
+    const inside = (r) => r.left >= b.left - 0.5 && r.right <= b.right + 0.5 && r.top >= b.top - 0.5 && r.bottom <= b.bottom + 0.5;
+    rows.push({
+      tab,
+      labels: `${src.selectedOptions[0].textContent} | ${tgt.selectedOptions[0].textContent}`,
+      gap: Math.round(Math.min(m.left - s.right, t.left - m.right) * 10) / 10,
+      inside: [s, m, t].every(inside),
+      painted: hits(src, s.left + 1, midY(s)) && hits(src, s.right - 1, midY(s)) &&
+        hits(mid, m.left + 2, midY(m)) && hits(mid, m.right - 2, midY(m)) &&
+        hits(tgt, t.left + 1, midY(t)) && hits(tgt, t.right - 1, midY(t)),
+      offCenter: Math.round(((m.left + m.right) / 2 - centerX) * 10) / 10,
+    });
+  };
+  const variants = [
+    ["auto", "한국어 (감지됨)", "zh-Hant"],
+    ["auto", "중국어(번체)·인도네시아어 (감지됨)", "id"],
+    ["sw", null, "et"],
+  ];
+  const fill = (src, tgt, [source, label, target]) => {
+    src.value = source;
+    if (label) setAutoLabel(src, label);
+    tgt.value = target;
+  };
+  const textBar = q("#panel-text .langbar");
+  // side-by-side panes: the swap button sits on the divider; stacked panes: centre of the bar
+  const paneSrc = box(q(".pane-src")), paneOut = box(q(".pane-out"));
+  const textCenter = paneOut.top < paneSrc.bottom - 1 ? paneOut.left : (box(textBar).left + box(textBar).right) / 2;
+  for (const variant of variants) {
+    fill(q("#srcLang"), q("#tgtLang"), variant);
+    measure("text", textBar, q("#srcLang"), q("#swapBtn"), q("#tgtLang"), textCenter);
+  }
+  q("#tab-docs").click();
+  const docBar = q("#panel-docs .langbar");
+  for (const variant of variants) {
+    fill(q("#docSrc"), q("#docTgt"), variant);
+    measure("docs", docBar, q("#docSrc"), docBar.querySelector(".langbar-arrow"), q("#docTgt"), (box(docBar).left + box(docBar).right) / 2);
+  }
+  return rows;
+}"""
+
+# Glossary manager on a phone: every glossary name must fit the picker without being cut to "…".
+GLOSSARY_PICKER_RUN = r"""async () => {
+  document.querySelector("#glossaryBtn").click();
+  const dialog = await __t.until(() => document.querySelector("dialog.gl-dialog[open]"));
+  const picker = await __t.until(() => dialog.querySelector(".gl-picker option") && dialog.querySelector(".gl-picker"));
+  const style = getComputedStyle(picker);
+  const ctx = document.createElement("canvas").getContext("2d");
+  ctx.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+  const avail = picker.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+  const labels = [...picker.options].map((option) => option.textContent);
+  const room = Math.min(...labels.map((label) => avail - ctx.measureText(label).width));
+  const bar = dialog.querySelector(".gl-toolbar").getBoundingClientRect();
+  const inside = [...dialog.querySelectorAll(".gl-toolbar button, .gl-toolbar select")].every((node) => {
+    const r = node.getBoundingClientRect();
+    return r.left >= bar.left - 0.5 && r.right <= bar.right + 0.5;
+  });
+  return { labels, room: Math.round(room), inside };
+}"""
 
 
 def scenarios(ids: dict[str, str]) -> list[dict[str, Any]]:
@@ -785,6 +861,13 @@ __t.mocks.push((url, method) => {{
   return { afterKorean, afterEnglish, stored: JSON.parse(localStorage.getItem("translator.targetLang")) };
 }""",
         },
+        *({"name": f"langbar_{viewport[0]}", "viewport": viewport, "run": LANGBAR_RUN} for viewport in LANGBAR_VIEWPORTS),
+        {
+            "name": "glossary_picker_360",
+            "viewport": [360, 740],
+            "init": f"localStorage.setItem('translator.glossaryId', JSON.stringify({saved}));",
+            "run": GLOSSARY_PICKER_RUN,
+        },
     ]
 
 
@@ -1043,3 +1126,21 @@ def test_same_language_input_switches_target_like_deepl(ui) -> None:
     assert result["afterKorean"] == "en"
     assert result["afterEnglish"] == "ko"
     assert result["stored"] == "ko"
+
+
+@pytest.mark.parametrize("width", [viewport[0] for viewport in LANGBAR_VIEWPORTS])
+def test_language_selects_never_overlap_swap_control(ui, width: int) -> None:
+    rows = value(ui, f"langbar_{width}")
+    assert {row["tab"] for row in rows} == {"text", "docs"}
+    for row in rows:
+        assert row["gap"] >= 4, row  # select boxes keep clear of the swap button / arrow (focus ring is 3 px)
+        assert row["inside"], row
+        assert row["painted"], row  # nothing paints over the edges of either select or the middle control
+        assert abs(row["offCenter"]) <= 1, row  # middle control stays on the pane divider
+
+
+def test_glossary_picker_shows_whole_name_on_phones(ui) -> None:
+    result = value(ui, "glossary_picker_360")
+    assert len(result["labels"]) >= 5, result
+    assert result["room"] >= 0, result  # the longest name fits without being cut to "…"
+    assert result["inside"], result
